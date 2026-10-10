@@ -2,6 +2,8 @@
 
 Figma plugin for exporting selected frames to a smaller size PDF while preserving vector text and artwork.
 
+https://github.com/user-attachments/assets/ad06c311-1dfe-4fe4-932e-f706a923de3a
+
 ## Install
 
 Requires **Figma Desktop** and **Node.js 20.19+**.
