@@ -24,10 +24,13 @@ Run **Compress PDF**, select frames, set their order, choose compression, and ex
 - **Output:** one PDF page with frames stacked vertically.
 - **Presets:** Balanced, Smallest, High quality, or Lossless. Custom DPI and quality are available.
 - **Local processing:** original frames stay unchanged. If compression does not reduce size, the native export is returned.
-- **Limits:** 300 frames, 200 MiB native PDF, and 100,000 px per stack dimension. Already optimized PDFs may shrink only slightly.
+- **Long pages:** single frames and combined stacks use native PDF export without an arbitrary pixel-height limit. Frames retain their original size, vector artwork, and listed order.
+- **Limits:** 300 frames and 200 MiB native PDF. Figma must be able to export the artwork; already optimized PDFs may shrink only slightly.
 
 ## Development
 
 `npm run verify` runs checks, build, and tests (requires Google Chrome). Rebuild with `npm run build` after code changes.
+
+Tests cover the Figma message flow, cancellation and retry, worker fallback, PDF drawing commands, transparency masks, image placement, and the output size guard.
 
 [Third-party notices](THIRD_PARTY_NOTICES.md).

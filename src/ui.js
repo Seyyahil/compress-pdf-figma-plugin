@@ -3,27 +3,55 @@ const $ = id => document.getElementById(id);
 const post = msg => parent.postMessage({ pluginMessage: msg }, '*');
 const size = n => n < 1_000_000 ? `${(n/1000).toFixed(0)} KB` : `${(n/1_000_000).toFixed(n >= 10_000_000 ? 1 : 2)} MB`;
 let frames = [], output = null, busy = false, job = 0, parts = [], worker = null, sequence = 0, abort = null, workerUnavailable = false, exportFrames = [];
+let settingsTouched = false;
 const pending = new Map();
-function stopWorker(error = new Error('Cancelled')) { worker?.terminate(); worker = null; for (const p of pending.values()) p.reject(error); pending.clear(); abort?.abort(); }
+function stopWorker(error = new Error('Cancelled')) {
+  const previous = worker; worker = null;
+  if (previous) { previous.onmessage = null; previous.onerror = null; previous.terminate(); }
+  for (const p of pending.values()) p.reject(error);
+  pending.clear(); abort?.abort();
+}
 function getWorker() {
   if (workerUnavailable) return null;
   if (worker) return worker;
   const url = URL.createObjectURL(new Blob([__WORKER_SOURCE__], { type: 'text/javascript' }));
   try {
-    worker = new Worker(url);
+    const currentWorker = new Worker(url);
+    worker = currentWorker;
     let started = false;
-    worker.onmessage = e => { if (e.data.ready) { started = true; return; } const { id, progress, result, error } = e.data, p = pending.get(id); if (!p) return; if (progress) p.progress?.(progress); else { pending.delete(id); error ? p.reject(new Error(error)) : p.resolve(result); } };
-    worker.onerror = () => { const error = new Error(started ? 'The local PDF worker stopped. Retry with fewer pages.' : 'WORKER_UNAVAILABLE'); if (!started) workerUnavailable = true; stopWorker(error); };
+    currentWorker.onmessage = e => {
+      if (worker !== currentWorker) return;
+      if (e.data.ready) { started = true; return; }
+      const { id, progress, result, error } = e.data, request = pending.get(id);
+      if (!request) return;
+      if (progress) request.progress?.(progress);
+      else { pending.delete(id); error ? request.reject(new Error(error)) : request.resolve(result); }
+    };
+    currentWorker.onerror = () => {
+      if (worker !== currentWorker) return;
+      const error = new Error(started ? 'The local PDF worker stopped. Retry with fewer pages.' : 'WORKER_UNAVAILABLE');
+      if (!started) workerUnavailable = true;
+      stopWorker(error);
+    };
     return worker;
   } finally { URL.revokeObjectURL(url); }
 }
-async function call(action, data, progress) {
+async function call(action, data, progress, current) {
+  if (current !== job) throw new Error('Cancelled');
   let w; try { w = getWorker(); } catch { /* Hosts that block blob workers can still process locally. */ }
   if (!w) {
-    abort = new AbortController(); return compressPdf(data.bytes, data.options, progress, abort.signal);
+    const controller = new AbortController(); abort = controller;
+    try { return await compressPdf(data.bytes, data.options, progress, controller.signal); }
+    finally { if (abort === controller) abort = null; }
   }
-  try { return await new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject, progress }); w.postMessage({ id, action, ...data }); }); }
-  catch (e) { if (e.message === 'WORKER_UNAVAILABLE') return call(action,data,progress); throw e; }
+  try {
+    return await new Promise((resolve, reject) => {
+      const id = ++sequence; pending.set(id, { resolve, reject, progress });
+      try { w.postMessage({ id, action, ...data }); }
+      catch (error) { pending.delete(id); reject(error); }
+    });
+  }
+  catch (e) { if (e.message === 'WORKER_UNAVAILABLE') return call(action,data,progress,current); throw e; }
 }
 function status(text, error = false) { $('status').textContent = text; $('status').classList.toggle('error', error); }
 function controls() {
@@ -74,7 +102,7 @@ function options() {
   return { preset: p, ...(p !== 'lossless' ? { dpi:Number($('dpi').value), quality:Number($('quality').value)/100 } : {}) };
 }
 async function compress(bytes, current) {
-  const result = await call('compress', { bytes, options: options() }, p => { if (current !== job) return; $('progress').value = p.value; status(`${p.phase}${p.attempts > 1 ? ` · pass ${p.attempt}` : ''}`); });
+  const result = await call('compress', { bytes, options: options() }, p => { if (current !== job) return; $('progress').value = p.value; status(`${p.phase}${p.attempts > 1 ? ` · pass ${p.attempt}` : ''}`); }, current);
   if (current !== job) return;
   output = result;
   $('sizes').textContent = `${size(result.originalBytes)} → ${size(result.outputBytes)}`;
@@ -91,7 +119,7 @@ async function compress(bytes, current) {
 async function run() {
   if (busy || !frames.length || frames.length > LIMITS.pages) return;
   try { options(); } catch (e) { status(e.message, true); return; }
-  clearResult(); busy = true; const current = ++job; $('progress').value = 0; controls();
+  settingsTouched = true; clearResult(); busy = true; const current = ++job; $('progress').value = 0; controls();
   try {
     parts = []; exportFrames = frames.slice(); post({ type:'export', ids:exportFrames.map(f=>f.id), requestId:current }); status('Exporting frames…');
   } catch (e) { if (current !== job) return; busy = false; status(e.message, true); controls(); }
@@ -114,9 +142,10 @@ window.addEventListener('message', async e => {
     if (!busy) status(frames.length > LIMITS.pages ? 'Select no more than 300 frames.' : frames.length ? `${frames.length} ${frames.length===1?'frame':'frames'} ready.` : 'Select frames in Figma.');
   } else if (msg.type === 'selection-error') {
     if (!busy) status(msg.message,true);
-  } else if (msg.type === 'preferences' && msg.preferences) {
-    const p = msg.preferences; if (PRESETS[p.preset]) { $('preset').value = p.preset; preset(); } if (typeof p.filename === 'string') $('filename').value = p.filename;
+  } else if (msg.type === 'preferences' && msg.preferences && !busy && !settingsTouched) {
+    const p = msg.preferences; if (Object.hasOwn(PRESETS, p.preset)) { $('preset').value = p.preset; preset(); } if (typeof p.filename === 'string') $('filename').value = p.filename;
   } else if (msg.requestId === job && busy) {
+    if (msg.type === 'export-waiting') status('Finishing the cancelled export…');
     if (msg.type === 'export-progress') { status(`Exporting ${msg.index+1} / ${msg.count}: ${msg.name}`); $('progress').value = .3 * msg.index/msg.count; }
     if (msg.type === 'frame-pdf') { parts.push(new Uint8Array(msg.bytes)); post({type:'ack', requestId:job, index:msg.index}); }
     if (msg.type === 'export-complete') {
@@ -127,10 +156,11 @@ window.addEventListener('message', async e => {
     if (msg.type === 'export-error') { busy=false; parts=[]; status(msg.message,true); controls(); }
   }
 });
-$('preset').onchange = preset;
-for (const id of ['dpi','quality']) $(id).onchange = () => { clearResult(); $('preset-help').textContent = `Custom image settings · ${$('dpi').value} DPI · ${$('quality').value}% quality.`; };
+$('preset').onchange = () => { settingsTouched = true; preset(); };
+$('filename').oninput = () => { settingsTouched = true; };
+for (const id of ['dpi','quality']) $(id).onchange = () => { settingsTouched = true; clearResult(); $('preset-help').textContent = `Custom image settings · ${$('dpi').value} DPI · ${$('quality').value}% quality.`; };
 $('run').onclick = run;
-$('cancel').onclick = () => { job++; post({type:'cancel'}); stopWorker(); parts=[]; busy=false; status('Cancelled. Your source is unchanged.'); controls(); };
+$('cancel').onclick = () => { const requestId = job++; post({type:'cancel',requestId}); stopWorker(); parts=[]; busy=false; status('Cancelled. Your source is unchanged.'); controls(); };
 $('download').onclick = download;
 const resizeHandle = $('resize-handle');
 let resizeDrag = null, resizeFrame = 0, resizeSize = null;

@@ -81,13 +81,13 @@ function* tokens(text) {
   let i = 0;
   while (i < text.length) {
     const c = text[i];
-    if (/\s/.test(c)) { i++; continue; }
+    if (/[\x00\t\n\f\r ]/.test(c)) { i++; continue; }
     if (c === '%') { while (i < text.length && !/[\r\n]/.test(text[i])) i++; continue; }
     if (c === '(') { let depth = 1; i++; while (i < text.length && depth) { if (text[i] === '\\') i += 2; else { if (text[i] === '(') depth++; if (text[i] === ')') depth--; i++; } } yield '(string)'; continue; }
     if (c === '<' && text[i + 1] !== '<') { while (i < text.length && text[i] !== '>') i++; i++; yield '<hex>'; continue; }
     if ('[]<>'.includes(c)) { i++; yield c; continue; }
     const start = i++;
-    while (i < text.length && !/[\s()[\]<>/%]/.test(text[i])) i++;
+    while (i < text.length && !/[\x00\t\n\f\r ()[\]<>/%]/.test(text[i])) i++;
     yield text.slice(start, i);
   }
 }
@@ -98,7 +98,11 @@ function decodedContent(context, object) {
   if (!(object instanceof PDFRawStream) || object.getContentsSize() > 16_000_000 || params(object)) throw new Error('Unsupported content stream');
   const b = decodePDFRawStream(object).decode();
   if (b.length > 32_000_000) throw new Error('Content stream too large');
-  return new TextDecoder('latin1').decode(b);
+  // PDF tokens contain byte-valued names. TextDecoder's "latin1" uses
+  // Windows-1252 and changes bytes 0x80-0x9f into different characters.
+  const chunks = [];
+  for (let i = 0; i < b.length; i += 32768) chunks.push(String.fromCharCode(...b.subarray(i, i + 32768)));
+  return chunks.join('');
 }
 function placements(doc) {
   const usage = new Map(); let operations = 0;
@@ -117,7 +121,8 @@ function placements(doc) {
     return false;
   }
   function scan(text, resources, initial, path, depth) {
-    if (!(resources instanceof PDFDict) || depth > 16) return;
+    if (depth > 16) throw new Error('Placement scan depth limit');
+    if (!(resources instanceof PDFDict)) return;
     const xobjects = resources.lookup(N('XObject'));
     if (!(xobjects instanceof PDFDict)) return;
     const stack = [], operands = []; let matrix = initial.slice();
@@ -139,13 +144,13 @@ function placements(doc) {
             old.width = Math.max(old.width, Math.hypot(matrix[0], matrix[1]));
             old.height = Math.max(old.height, Math.hypot(matrix[2], matrix[3]));
             usage.set(id, old);
-          } else if (object instanceof PDFRawStream && named(object.dict, 'Subtype') === 'Form' && !path.has(object)) {
+          } else if (object instanceof PDFRawStream && named(object.dict, 'Subtype') === 'Form') {
+            if (path.has(object)) throw new Error('Cyclic form placement');
             const fm = object.dict.lookup(N('Matrix'));
             const formMatrix = fm instanceof PDFArray ? fm.asArray().map(n => context.lookup(n)).map(n => n instanceof PDFNumber ? n.asNumber() : NaN) : [1,0,0,1,0,0];
-            if (formMatrix.length === 6 && formMatrix.every(Number.isFinite)) {
-              path.add(object);
-              try { scan(decodedContent(context, object), object.dict.lookup(N('Resources')) || resources, mul(matrix, formMatrix), path, depth + 1); } finally { path.delete(object); }
-            }
+            if (formMatrix.length !== 6 || !formMatrix.every(Number.isFinite)) throw new Error('Invalid form transform');
+            path.add(object);
+            try { scan(decodedContent(context, object), object.dict.lookup(N('Resources')) || resources, mul(matrix, formMatrix), path, depth + 1); } finally { path.delete(object); }
           }
         }
       }
@@ -248,7 +253,17 @@ async function reflate(doc, signal) {
   for (const [ref, o] of doc.context.enumerateIndirectObjects()) {
     check(signal);
     if (o instanceof PDFRawStream && !isImage(o) && !params(o) && ['', 'FlateDecode', 'LZWDecode', 'ASCII85Decode', 'ASCIIHexDecode'].includes(filterName(o)) && o.getContentsSize() < 16_000_000) {
-      try { const decoded = decodePDFRawStream(o).decode(); if (decoded.length <= 32_000_000) { const data = pako.deflate(decoded, { level: 9 }); if (data.length < o.getContentsSize() - 32) { const d = cloneDict(o.dict); d.delete(N('DecodeParms')); d.delete(N('Length')); d.set(N('Filter'), N('FlateDecode')); doc.context.assign(ref, PDFRawStream.of(d, data)); count++; } } } catch { /* Unknown encodings stay intact. */ }
+      try {
+        const decoded = decodePDFRawStream(o).decode();
+        if (decoded.length <= 32_000_000) {
+          const data = pako.deflate(decoded, { level: 9 });
+          if (data.length < o.getContentsSize() - 32) {
+            const d = cloneDict(o.dict);
+            d.delete(N('DecodeParms')); d.delete(N('Length')); d.set(N('Filter'), N('FlateDecode'));
+            doc.context.assign(ref, PDFRawStream.of(d, data)); count++;
+          }
+        }
+      } catch { /* Unknown encodings stay intact. */ }
     }
     if (++i % 50 === 0) await tick();
   }

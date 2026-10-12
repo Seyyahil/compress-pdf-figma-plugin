@@ -64,6 +64,59 @@ test('balanced compression preserves page sizes, text, URLs, transparency and CM
   assert.ok(images.some(o=>o.dict.get(PDFName.of('ColorSpace'))?.toString()==='/DeviceCMYK'&&o.dict.lookup(PDFName.of('Width')).asNumber()===64),'CMYK must be left intact');
 });
 
+test('compression preserves a 120,000-unit native PDF page and drawing instructions at both ends',async()=>{
+  const native=await PDFDocument.load(await fixture({pages:1,dimension:256}));
+  const p=native.getPage(0),font=await native.embedFont(StandardFonts.Helvetica);
+  p.setSize(600,120000);p.drawText('TOP OF LONG PAGE',{x:20,y:119960,size:24,font});p.drawText('BOTTOM OF LONG PAGE',{x:20,y:20,size:24,font});
+  const bytes=await native.save();files.set('/long-native.pdf',bytes);
+  const result=await page.evaluate(async()=>{const source=new Uint8Array(await(await fetch('/long-native.pdf')).arrayBuffer());const r=await Crisp.compressPdf(source,{preset:'balanced'});await fetch('/save/long-compressed.pdf',{method:'POST',body:r.bytes});return{pages:r.pages,input:r.originalBytes,output:r.outputBytes};});
+  assert.equal(result.pages,1);assert.ok(result.output<=result.input);
+  const original=await PDFDocument.load(bytes),output=await PDFDocument.load(await readFile('work/qa/long-compressed.pdf'));
+  assert.deepEqual(output.getPage(0).getSize(),{width:600,height:120000});
+  const drawing=document=>document.getPage(0).node.Contents().asArray().map(ref=>Buffer.from(decodePDFRawStream(document.context.lookup(ref)).decode()).toString('latin1'));
+  assert.deepEqual(drawing(output),drawing(original),'No scaling, clipping, or rasterization of long-page text and vector instructions');
+});
+
+test('recompressing unfiltered and ASCIIHex vector streams preserves decoded drawing commands',async()=>{
+  const commands=Buffer.from(('q 0.2 0.5 0.8 rg 20 20 560 560 re f Q\n').repeat(300));
+  for(const filter of ['', 'ASCIIHexDecode']){
+    const doc=await PDFDocument.create(),p=doc.addPage([600,600]);
+    const encoded=filter?Buffer.from(commands.toString('hex')+'>'):commands;
+    const stream=doc.context.register(PDFRawStream.of(doc.context.obj(filter?{Filter:filter}:{}),encoded));p.node.set(PDFName.of('Contents'),stream);
+    const source=await doc.save({useObjectStreams:false}),name=filter?'asciihex-vector':'unfiltered-vector';files.set('/'+name+'.pdf',source);
+    const result=await page.evaluate(async name=>{const bytes=new Uint8Array(await(await fetch('/'+name+'.pdf')).arrayBuffer());const r=await Crisp.compressPdf(bytes,{preset:'lossless'});await fetch('/save/'+name+'.pdf',{method:'POST',body:r.bytes});return{streams:r.streams,output:r.outputBytes,input:r.originalBytes};},name);
+    assert.ok(result.streams>0);assert.ok(result.output<result.input);
+    const output=await PDFDocument.load(await readFile('work/qa/'+name+'.pdf')),content=output.context.lookup(output.getPage(0).node.Contents());
+    assert.deepEqual(Buffer.from(decodePDFRawStream(content).decode()),commands,'Changing stream encoding must not change drawing commands');
+  }
+});
+
+test('an image used through deeply nested forms retains its full resolution when scanning is incomplete',async()=>{
+  const doc=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=doc.getPage(0),n=PDFName.of;
+  const photo=p.node.Resources().lookup(n('XObject')).get(n('Photo'));
+  let nested=doc.context.register(doc.context.flateStream('q 600 0 0 600 0 0 cm /Photo Do Q',{Type:'XObject',Subtype:'Form',BBox:[0,0,900,700],Resources:{XObject:{Photo:photo}}}));
+  for(let i=0;i<20;i++)nested=doc.context.register(doc.context.flateStream('/Nested Do',{Type:'XObject',Subtype:'Form',BBox:[0,0,900,700],Resources:{XObject:{Nested:nested}}}));
+  p.node.setXObject(n('Deep'),nested);p.node.set(n('Contents'),doc.context.register(doc.context.flateStream('q 24 0 0 24 0 0 cm /Photo Do Q /Deep Do')));
+  files.set('/deep-form.pdf',await doc.save());
+  await page.evaluate(async()=>{const bytes=new Uint8Array(await(await fetch('/deep-form.pdf')).arrayBuffer());const r=await Crisp.compressPdf(bytes,{preset:'balanced'});await fetch('/save/deep-form.pdf',{method:'POST',body:r.bytes});});
+  const output=await PDFDocument.load(await readFile('work/qa/deep-form.pdf'));
+  const images=output.context.enumerateIndirectObjects().map(([,o])=>o).filter(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image');
+  assert.equal(images.length,1);assert.equal(images[0].dict.lookup(n('Width')).asNumber(),1024);assert.equal(images[0].dict.lookup(n('Height')).asNumber(),1024);
+});
+
+test('non-ASCII PDF resource names do not hide a larger use of a shared image',async()=>{
+  for(const byte of [0x80,0xa0]){
+    const doc=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=doc.getPage(0),n=PDFName.of;
+    const key='X'+String.fromCharCode(byte),photo=p.node.Resources().lookup(n('XObject')).get(n('Photo'));p.node.setXObject(n(key),photo);
+    p.node.set(n('Contents'),doc.context.register(doc.context.flateStream('q 24 0 0 24 0 0 cm /Photo Do Q q 600 0 0 600 0 0 cm /'+key+' Do Q')));
+    files.set('/resource-name.pdf',await doc.save());
+    await page.evaluate(async()=>{const r=await Crisp.compressPdf(new Uint8Array(await(await fetch('/resource-name.pdf')).arrayBuffer()),{preset:'balanced'});await fetch('/save/resource-name.pdf',{method:'POST',body:r.bytes});});
+    const output=await PDFDocument.load(await readFile('work/qa/resource-name.pdf'));
+    const image=output.context.enumerateIndirectObjects().map(([,o])=>o).find(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image');
+    assert.equal(image.dict.lookup(n('Width')).asNumber(),1024);assert.equal(image.dict.lookup(n('Height')).asNumber(),1024);
+  }
+});
+
 test('lossless compression keeps decoded RGB pixels unchanged',async()=>{
   await page.evaluate(async()=>{const b=new Uint8Array(await(await fetch('/sample.pdf')).arrayBuffer());const r=await Crisp.compressPdf(b,{preset:'lossless'});await fetch('/save/lossless.pdf',{method:'POST',body:r.bytes});});
   const doc=await PDFDocument.load(await readFile('work/qa/lossless.pdf')),original=await PDFDocument.load(files.get('/sample.pdf'));
@@ -211,6 +264,34 @@ test('new selected frames appear during an active export and join the next expor
   await panel.locator('#run').click();await ui.waitForFunction(()=>window.lastExportIds.length===3);assert.deepEqual(await ui.evaluate(()=>window.lastExportIds),['1:2','1:1','1:3']);await panel.locator('#cancel').click();await ui.close();
 });
 
+test('late stored preferences cannot override settings while a PDF export is in progress',async()=>{
+  const ui=await browser.newPage();await ui.goto(url+'/live-host.html');const panel=ui.frame({name:'plugin'});await panel.locator('.frame').first().waitFor();
+  await panel.locator('#preset').selectOption('print');await panel.locator('#run').click();await ui.waitForFunction(()=>typeof window.finishExport==='function');
+  await panel.evaluate(()=>window.dispatchEvent(new MessageEvent('message',{data:{pluginMessage:{type:'preferences',preferences:{preset:'smallest',filename:'Old preference'}}}})));
+  assert.equal(await panel.locator('#preset').inputValue(),'print');assert.equal(await panel.locator('#dpi').inputValue(),'300');
+  await ui.evaluate(()=>window.finishExport());await panel.locator('#result-section').waitFor({state:'visible'});
+  await panel.evaluate(()=>window.dispatchEvent(new MessageEvent('message',{data:{pluginMessage:{type:'preferences',preferences:{preset:'smallest',filename:'Old preference'}}}})));
+  assert.equal(await panel.locator('#preset').inputValue(),'print');assert.equal(await panel.locator('#result-section').isVisible(),true);await ui.close();
+});
+
+test('an error queued by a cancelled worker cannot terminate the next compression job',async()=>{
+  const ui=await browser.newPage();await ui.addInitScript(()=>{
+    window.testWorkers=[];window.Worker=class {
+      constructor(){window.testWorkers.push(this);}
+      set onerror(fn){this.errorHandler=fn;if(fn)this.savedError=fn;}
+      get onerror(){return this.errorHandler;}
+      postMessage(request){this.request=request;}
+      terminate(){this.terminated=true;}
+    };
+  });
+  await ui.goto(url+'/host.html');const panel=ui.frame({name:'plugin'});await panel.locator('.frame').first().waitFor();await panel.locator('#run').click();await panel.waitForFunction(()=>window.testWorkers[0]?.request);
+  await panel.locator('#cancel').click();await panel.locator('#run').click();await panel.waitForFunction(()=>window.testWorkers[1]?.request);
+  await panel.evaluate(()=>window.testWorkers[0].savedError());
+  assert.equal(await panel.evaluate(()=>!!window.testWorkers[1].terminated),false,'A stale callback must not stop the new worker');
+  await panel.evaluate(()=>{const w=window.testWorkers[1],r=w.request;w.onmessage({data:{id:r.id,result:{bytes:r.bytes,pages:1,originalBytes:r.bytes.length,outputBytes:r.bytes.length,savedPercent:0,originalRetained:true,optimized:0,duplicates:0,skipped:0}}});});
+  await panel.locator('#result-section').waitFor({state:'visible'});await ui.close();
+});
+
 test('hosts blocking blob workers still compress locally',async()=>{
   const ui=await browser.newPage({viewport:{width:440,height:740}});await ui.goto(url+'/blocked-host.html');const panel=ui.frame({name:'plugin'});await panel.locator('.frame').first().waitFor();await panel.locator('#run').click();await panel.locator('#result-section').waitFor({state:'visible'});assert.match(await panel.locator('#savings').textContent(),/smaller/);await ui.close();
 });
@@ -253,7 +334,7 @@ function nativeStackMock({fail=false,hold=false}={}) {
   }
   const a=frame('a',600,700,120,80),b=frame('b',375,900,1000,40);pageNode.selection=[a,b];
   const figma={currentPage:pageNode,root:{},showUI(){},on(){},createFrame:()=>frame('temporary:'+ ++sequence),variables:{getVariableCollectionByIdAsync:async id=>({id})},getNodeByIdAsync:async id=>[a,b].find(n=>n.id===id),ui:{postMessage(msg){posted.push(msg);if(msg.type==='frame-pdf')queueMicrotask(()=>onmessage({type:'ack',requestId:msg.requestId,index:msg.index}));},set onmessage(fn){onmessage=fn;}}};
-  return{figma,posted,calls,pageNode,a,b,message:m=>onmessage(m),release:()=>release?.(),waiting:()=>!!release};
+  return{figma,posted,calls,pageNode,a,b,message:m=>onmessage(m),release:()=>{const resolve=release;release=undefined;resolve?.();},waiting:()=>!!release};
 }
 
 test('a frame stack is exported once in native Figma with manual order and original nodes intact',async()=>{
@@ -266,6 +347,23 @@ test('a frame stack is exported once in native Figma with manual order and origi
   assert.equal(mock.posted.filter(m=>m.type==='frame-pdf').length,1);assert.equal(mock.posted.at(-1).type,'export-complete');
 });
 
+test('single long frames and stacks beyond 100,000 px reach native PDF export at full size',async()=>{
+  for(const ids of [['a'],['b','a']]){
+    const mock=nativeStackMock();
+    Object.assign(mock.a,{height:120000,absoluteBoundingBox:{x:120,y:80,width:600,height:120000}});
+    Object.assign(mock.b,{height:90000,absoluteBoundingBox:{x:1000,y:40,width:375,height:90000}});
+    vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+    await mock.message({type:'export',ids,requestId:7});
+    assert.equal(mock.calls.length,1,'Export the whole native document once, preserving shared resources');
+    assert.equal(mock.calls[0].height,ids.length===1?120000:210000);
+    assert.equal(mock.calls[0].width,600);
+    if(ids.length>1){assert.deepEqual(mock.calls[0].frames.map(f=>f.source),['b','a']);assert.deepEqual(mock.calls[0].frames.map(f=>f.y),[0,90000]);}
+    assert.equal(mock.posted.at(-1).type,'export-complete');
+    assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);assert.deepEqual(mock.pageNode.selection,[mock.a,mock.b]);
+    assert.equal(mock.a.height,120000);assert.equal(mock.b.height,90000);
+  }
+});
+
 test('native export errors and cancellation always remove temporary copies',async()=>{
   for(const options of [{fail:true},{hold:true}]){
     const mock=nativeStackMock(options);vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
@@ -274,6 +372,44 @@ test('native export errors and cancellation always remove temporary copies',asyn
     await job;assert.equal(mock.posted.at(-1).type,'export-error');assert.match(mock.posted.at(-1).message,options.hold?/Cancelled/:/Native export failed/);
     assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);assert.equal(mock.a.removed,false);assert.equal(mock.b.removed,false);assert.equal(mock.posted.filter(m=>m.type==='frame-pdf').length,0);
   }
+});
+
+test('a new export requested immediately after cancellation waits and completes instead of being lost',async()=>{
+  const mock=nativeStackMock({hold:true});vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  const first=mock.message({type:'export',ids:['a','b'],requestId:10});while(!mock.waiting())await new Promise(r=>setImmediate(r));
+  await mock.message({type:'cancel',requestId:10});await mock.message({type:'export',ids:['b'],requestId:11});assert.equal(mock.calls.length,1);mock.release();await first;
+  for(let i=0;i<100&&mock.calls.length<2;i++)await new Promise(r=>setTimeout(r,5));
+  assert.equal(mock.calls.length,2,'The replacement export must be accepted after the cancelled native operation finishes');mock.release();
+  for(let i=0;i<100&&!mock.posted.some(m=>m.type==='export-complete'&&m.requestId===11);i++)await new Promise(r=>setTimeout(r,5));
+  assert.ok(mock.posted.some(m=>m.type==='export-complete'&&m.requestId===11));assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
+});
+
+test('cancelling a queued replacement and closing the plugin never leave temporary artwork or run queued exports',async()=>{
+  for(const close of [false,true]){
+    const mock=nativeStackMock({hold:true}),events=new Map();mock.figma.on=(name,handler)=>events.set(name,handler);
+    vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+    const first=mock.message({type:'export',ids:['a','b'],requestId:20});while(!mock.waiting())await new Promise(r=>setImmediate(r));
+    await mock.message({type:'cancel',requestId:20});await mock.message({type:'export',ids:['b'],requestId:21});
+    if(close)events.get('close')();else await mock.message({type:'cancel',requestId:21});
+    mock.release();await first;await new Promise(r=>setImmediate(r));
+    assert.equal(mock.calls.length,1);assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);assert.ok(!mock.posted.some(m=>m.type==='frame-pdf'));
+    if(close){const count=mock.posted.length;await mock.message({type:'export',ids:['a'],requestId:22});assert.equal(mock.posted.length,count);}
+  }
+});
+
+test('cancellation during asynchronous node lookup does not start native rendering',async()=>{
+  const mock=nativeStackMock();let resolveLookup;mock.figma.getNodeByIdAsync=()=>new Promise(r=>resolveLookup=r);
+  vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  const job=mock.message({type:'export',ids:['a'],requestId:30});await mock.message({type:'cancel',requestId:30});resolveLookup(mock.a);await job;
+  assert.equal(mock.calls.length,0);assert.equal(mock.posted.at(-1).type,'export-error');assert.match(mock.posted.at(-1).message,/Cancelled/);
+});
+
+test('a failed PDF transfer clears its acknowledgement timer and permits a later export',async()=>{
+  const mock=nativeStackMock(),timers=new Set();let failed=false;const post=mock.figma.ui.postMessage;
+  mock.figma.ui.postMessage=message=>{if(message.type==='frame-pdf'&&!failed){failed=true;throw new Error('Transfer failed');}post(message);};
+  vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout:(fn,delay)=>{const timer=setTimeout(fn,delay);timers.add(timer);return timer;},clearTimeout:timer=>{timers.delete(timer);clearTimeout(timer);},console});
+  await mock.message({type:'export',ids:['a'],requestId:40});assert.equal(timers.size,0);assert.match(mock.posted.at(-1).message,/Transfer failed/);
+  await mock.message({type:'export',ids:['b'],requestId:41});assert.equal(mock.posted.at(-1).type,'export-complete');assert.equal(timers.size,0);
 });
 
 test('unavailable preference storage cannot block Figma selection or session settings',async()=>{

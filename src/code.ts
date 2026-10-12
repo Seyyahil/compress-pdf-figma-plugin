@@ -7,10 +7,19 @@ let activeRequest: number | undefined;
 let pendingIndex = -1;
 let sessionPreferences: unknown;
 let temporaryExport: FrameNode | null = null;
+let queuedExport: Message | null = null;
+let closed = false;
 function clearTemporaryExport() {
   const node = temporaryExport;
   temporaryExport = null;
   if (node && !node.removed) node.remove();
+}
+
+function post(message: unknown) {
+  if (!closed) figma.ui.postMessage(message);
+}
+function checkExport() {
+  if (cancelled || closed) throw new Error('Cancelled');
 }
 
 figma.showUI(__html__, { width: 440, height: 740, themeColors: true });
@@ -22,14 +31,15 @@ function frames(): FrameNode[] {
 }
 function selection() {
   const nodes = frames();
-  figma.ui.postMessage({ type: 'selection', frames: nodes.map(n => ({ id: n.id, name: n.name })), ignored: figma.currentPage.selection.length - nodes.length });
+  post({ type: 'selection', frames: nodes.map(n => ({ id: n.id, name: n.name })), ignored: figma.currentPage.selection.length - nodes.length });
 }
 async function sendSelection() {
-  try { await selection(); }
-  catch { figma.ui.postMessage({ type: 'selection-error', message: 'Could not read your selection. Select the frames again.' }); }
+  try { selection(); }
+  catch { post({ type: 'selection-error', message: 'Could not read your selection. Select the frames again.' }); }
 }
 type Message = { type: string; ids?: string[]; requestId?: number; index?: number; preferences?: unknown; width?: number; height?: number };
-figma.ui.onmessage = async (msg: Message) => {
+async function onMessage(msg: Message) {
+  if (closed || !msg || typeof msg !== 'object') return;
   if (msg.type === 'resize') {
     if (typeof msg.width === 'number' && Number.isFinite(msg.width) && typeof msg.height === 'number' && Number.isFinite(msg.height)) {
       figma.ui.resize(Math.max(360, Math.min(2400, Math.round(msg.width))), Math.max(400, Math.min(1600, Math.round(msg.height))));
@@ -39,7 +49,7 @@ figma.ui.onmessage = async (msg: Message) => {
       try { sessionPreferences = await figma.clientStorage.getAsync('crisp-pdf-v1'); }
       catch { /* Optional preference storage must not block the panel or frame selection. */ }
     }
-    figma.ui.postMessage({ type: 'preferences', preferences: sessionPreferences });
+    post({ type: 'preferences', preferences: sessionPreferences });
     await sendSelection();
   } else if (msg.type === 'preferences' && msg.preferences && typeof msg.preferences === 'object') {
     const p = msg.preferences as { preset?: string; filename?: string };
@@ -50,19 +60,33 @@ figma.ui.onmessage = async (msg: Message) => {
         catch { /* Keep preferences for this session when persistent storage is unavailable. */ }
       }
     }
-  } else if (msg.type === 'cancel') { cancelled = true; acknowledge?.(); }
+  } else if (msg.type === 'cancel') {
+    if (queuedExport && (msg.requestId == null || msg.requestId === queuedExport.requestId)) queuedExport = null;
+    if (msg.requestId == null || msg.requestId === activeRequest) { cancelled = true; acknowledge?.(); }
+  }
   else if (msg.type === 'ack' && msg.requestId === activeRequest && msg.index === pendingIndex) { acknowledge?.(); }
   else if (msg.type === 'export') {
-    if (exporting) return;
+    if (exporting) {
+      if (cancelled) {
+        // Native export cannot be interrupted. Start the replacement once it finishes.
+        queuedExport = msg;
+        post({ type: 'export-waiting', requestId: msg.requestId });
+      } else if (msg.requestId !== activeRequest) {
+        post({ type: 'export-error', requestId: msg.requestId, message: 'A PDF export is already in progress.' });
+      }
+      return;
+    }
     const requestId = msg.requestId;
     activeRequest = requestId;
     exporting = true; cancelled = false;
     try {
       const ids = msg.ids || [];
-      if (!ids.length || ids.length > MAX_FRAMES || new Set(ids).size !== ids.length) throw new Error('Choose 1–300 unique frames.');
+      if (!Array.isArray(ids) || !ids.length || ids.length > MAX_FRAMES || ids.some(id => typeof id !== 'string' || !id) || new Set(ids).size !== ids.length) throw new Error('Choose 1–300 unique frames.');
       const nodes: FrameNode[] = [];
       for (const id of ids) {
+        checkExport();
         const node = await figma.getNodeByIdAsync(id);
+        checkExport();
         if (!node || node.type !== 'FRAME' || node.parent?.type === 'DOCUMENT') throw new Error('A selected frame is no longer available. Select the frames again.');
         let ancestor: BaseNode | null = node;
         while (ancestor && ancestor.type !== 'PAGE') ancestor = ancestor.parent;
@@ -72,8 +96,9 @@ figma.ui.onmessage = async (msg: Message) => {
       // Export the complete stack once so Figma can share fonts, images and masks.
       // Independent per-frame PDFs can repeat those resources before compression.
       let bytes: Uint8Array;
+      checkExport();
       if (nodes.length === 1) {
-        figma.ui.postMessage({ type: 'export-progress', requestId, index: 0, count: 1, name: nodes[0].name });
+        post({ type: 'export-progress', requestId, index: 0, count: 1, name: nodes[0].name });
         bytes = await nodes[0].exportAsync({ format: 'PDF', contentsOnly: true, useAbsoluteBounds: true });
       } else {
         const snapshots = nodes.map(node => {
@@ -83,7 +108,9 @@ figma.ui.onmessage = async (msg: Message) => {
         });
         const width = Math.max(...snapshots.map(s => s.bounds.width));
         const height = snapshots.reduce((sum, s) => sum + s.bounds.height, 0);
-        if (!Number.isFinite(width) || !Number.isFinite(height) || width > 100000 || height > 100000) throw new Error('The combined page exceeds Figma’s frame-size limit. Export fewer frames.');
+        // Native PDF export supports pages taller than 100,000 px. Validate
+        // dimensions without imposing an unrelated raster/frame-size ceiling.
+        if (!Number.isFinite(width) || !Number.isFinite(height)) throw new Error('The combined page has invalid bounds.');
         const stack = figma.createFrame();
         temporaryExport = stack;
         stack.name = 'Compress PDF · temporary export';
@@ -93,9 +120,9 @@ figma.ui.onmessage = async (msg: Message) => {
         const collections = new Map<string, VariableCollection>();
         let top = 0;
         for (let i = 0; i < snapshots.length; i++) {
-          if (cancelled) throw new Error('Cancelled');
+          checkExport();
           const { node, bounds, transform, modes } = snapshots[i];
-          figma.ui.postMessage({ type: 'export-progress', requestId, index: i, count: nodes.length, name: node.name });
+          post({ type: 'export-progress', requestId, index: i, count: nodes.length, name: node.name });
           const viewport = figma.createFrame(); stack.appendChild(viewport);
           viewport.fills = []; viewport.strokes = []; viewport.effects = []; viewport.clipsContent = true;
           viewport.resizeWithoutConstraints(bounds.width, bounds.height); viewport.x = 0; viewport.y = top;
@@ -109,6 +136,7 @@ figma.ui.onmessage = async (msg: Message) => {
             let collection = collections.get(id);
             if (!collection) {
               const found = await figma.variables.getVariableCollectionByIdAsync(id);
+              checkExport();
               if (!found) throw new Error('A variable collection used by a selected frame is unavailable.');
               collection = found; collections.set(id, collection);
             }
@@ -116,9 +144,10 @@ figma.ui.onmessage = async (msg: Message) => {
           }
           top += bounds.height;
         }
+        checkExport();
         bytes = await stack.exportAsync({ format: 'PDF', contentsOnly: true, useAbsoluteBounds: true });
       }
-      if (cancelled) throw new Error('Cancelled');
+      checkExport();
       if (bytes.length > MAX_BYTES) throw new Error('The native export exceeds 200 MiB. Export fewer frames.');
       // Remove temporary artwork before delivering the PDF to the panel.
       clearTemporaryExport();
@@ -126,16 +155,24 @@ figma.ui.onmessage = async (msg: Message) => {
         pendingIndex = 0;
         const timeout = setTimeout(() => { acknowledge = null; reject(new Error('The PDF panel stopped responding. Reopen the plugin.')); }, 30000);
         acknowledge = () => { clearTimeout(timeout); acknowledge = null; resolve(); };
-        figma.ui.postMessage({ type: 'frame-pdf', requestId, index: 0, count: 1, bytes });
+        try { post({ type: 'frame-pdf', requestId, index: 0, count: 1, bytes }); }
+        catch (error) { clearTimeout(timeout); acknowledge = null; reject(error); }
       });
-      if (cancelled) throw new Error('Cancelled');
-      figma.ui.postMessage({ type: 'export-complete', requestId });
+      checkExport();
+      post({ type: 'export-complete', requestId });
     } catch (error) {
-      figma.ui.postMessage({ type: 'export-error', requestId, message: error instanceof Error ? error.message : String(error) });
-    } finally { clearTemporaryExport(); exporting = false; acknowledge = null; activeRequest = undefined; pendingIndex = -1; }
+      post({ type: 'export-error', requestId, message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      clearTemporaryExport(); exporting = false; acknowledge = null; activeRequest = undefined; pendingIndex = -1;
+      const next = queuedExport; queuedExport = null;
+      if (next && !closed) void onMessage(next);
+    }
   }
-};
-figma.on('close', clearTemporaryExport);
+}
+figma.ui.onmessage = onMessage;
+figma.on('close', () => {
+  closed = true; cancelled = true; queuedExport = null; acknowledge?.(); clearTemporaryExport();
+});
 figma.on('selectionchange', () => { void sendSelection(); });
 figma.on('currentpagechange', () => { void sendSelection(); });
 // Figma queues this initial snapshot until the UI loads; no ready handshake is required.
