@@ -95,7 +95,7 @@ test('an image used through deeply nested forms retains its full resolution when
   const doc=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=doc.getPage(0),n=PDFName.of;
   const photo=p.node.Resources().lookup(n('XObject')).get(n('Photo'));
   let nested=doc.context.register(doc.context.flateStream('q 600 0 0 600 0 0 cm /Photo Do Q',{Type:'XObject',Subtype:'Form',BBox:[0,0,900,700],Resources:{XObject:{Photo:photo}}}));
-  for(let i=0;i<20;i++)nested=doc.context.register(doc.context.flateStream('/Nested Do',{Type:'XObject',Subtype:'Form',BBox:[0,0,900,700],Resources:{XObject:{Nested:nested}}}));
+  for(let i=0;i<40;i++)nested=doc.context.register(doc.context.flateStream('/Nested Do',{Type:'XObject',Subtype:'Form',BBox:[0,0,900,700],Resources:{XObject:{Nested:nested}}}));
   p.node.setXObject(n('Deep'),nested);p.node.set(n('Contents'),doc.context.register(doc.context.flateStream('q 24 0 0 24 0 0 cm /Photo Do Q /Deep Do')));
   files.set('/deep-form.pdf',await doc.save());
   await page.evaluate(async()=>{const bytes=new Uint8Array(await(await fetch('/deep-form.pdf')).arrayBuffer());const r=await Crisp.compressPdf(bytes,{preset:'balanced'});await fetch('/save/deep-form.pdf',{method:'POST',body:r.bytes});});
@@ -324,6 +324,7 @@ function nativeStackMock({fail=false,hold=false}={}) {
   const posted=[],calls=[],pageNode={type:'PAGE',children:[],selection:[]};let onmessage,release,sequence=0;
   function frame(id,width=600,height=700,x=0,y=0) {
     const node={id,name:id,type:'FRAME',width,height,x,y,parent:pageNode,removed:false,children:[],absoluteBoundingBox:{x,y,width,height},absoluteTransform:[[1,0,x],[0,1,y]],resolvedVariableModes:{collection:'mode'},
+      findAllWithCriteria(){return [];},
       resizeWithoutConstraints(w,h){this.width=w;this.height=h;},
       appendChild(child){if(child.parent?.children){const i=child.parent.children.indexOf(child);if(i>=0)child.parent.children.splice(i,1);}child.parent=this;this.children.push(child);},
       clone(){const copy=frame('copy:'+id,width,height,x,y);copy.sourceId=id;copy.resolvedVariableModes={};return copy;},
@@ -431,4 +432,90 @@ test('Figma selection changes are delivered during export without generating thu
   const exporting=onmessage({type:'export',ids:['1:1'],requestId:1});while(!release)await new Promise(r=>setImmediate(r));
   pageNode.selection=[a,b,c];events.get('selectionchange')();const selected=posted.filter(m=>m.type==='selection').at(-1);assert.equal(selected.frames.length,3);assert.equal(selected.frames[2].name,'New frame');assert.deepEqual(Object.keys(selected.frames[2]).sort(),['id','name']);
   release();await exporting;assert.deepEqual(exports,['1:1']);assert.equal(posted.at(-1).type,'export-complete');assert.ok(posted.every(m=>m.type!=='thumbnail'));
+});
+
+test('large vector streams recompress without buffering or changing lossless drawing bytes',async()=>{
+  const commands=Buffer.from(('q 0.123456 0.5 0.8 rg 20.123456 20 560 560 re f Q\n').repeat(750000));
+  const doc=await PDFDocument.create(),p=doc.addPage([600,600]);
+  const zlib=await import('node:zlib');
+  const stream=doc.context.register(PDFRawStream.of(doc.context.obj({Filter:'FlateDecode'}),zlib.deflateSync(commands,{level:1})));
+  p.node.set(PDFName.of('Contents'),stream);files.set('/large-vector.pdf',await doc.save());
+  const result=await page.evaluate(async()=>{const r=await Crisp.compressPdf(new Uint8Array(await(await fetch('/large-vector.pdf')).arrayBuffer()),{preset:'lossless'});await fetch('/save/large-vector.pdf',{method:'POST',body:r.bytes});return{streams:r.streams,saved:r.savedPercent};});
+  assert.ok(commands.length>32000000);assert.ok(result.streams>0);assert.ok(result.saved>10);
+  const output=await PDFDocument.load(await readFile('work/qa/large-vector.pdf'));
+  assert.deepEqual(Buffer.from(decodePDFRawStream(output.context.lookup(output.getPage(0).node.Contents())).decode()),commands);
+});
+
+test('vector compaction bounds coordinate error through large shared transforms and preserves text bytes',async()=>{
+  const doc=await PDFDocument.create(),p=doc.addPage([600,600]),n=PDFName.of;
+  const path='1.123456 2.654321 m 3.987654 4.876543 l S\n';
+  const text='BT /F1 12 Tf 10 10 Td (Text \\(keeps\\) 9.123456 /Photo Do) Tj ET\n';
+  const font=await doc.embedFont(StandardFonts.Helvetica),zlib=await import('node:zlib');
+  const form=doc.context.register(PDFRawStream.of(doc.context.obj({Type:'XObject',Subtype:'Form',BBox:[0,0,10,10],Resources:{Font:{F1:font.ref}},Filter:'FlateDecode'}),zlib.deflateSync(Buffer.from((path+text).repeat(10000)),{level:1})));
+  p.node.setXObject(n('Artwork'),form);p.node.set(n('Contents'),doc.context.register(doc.context.flateStream('q .1 0 0 .1 0 0 cm /Artwork Do Q q 1000 0 0 1000 0 0 cm /Artwork Do Q')));
+  files.set('/precise-vector.pdf',await doc.save());
+  await page.evaluate(async()=>{const r=await Crisp.compressPdf(new Uint8Array(await(await fetch('/precise-vector.pdf')).arrayBuffer()),{preset:'balanced'});await fetch('/save/precise-vector.pdf',{method:'POST',body:r.bytes});});
+  const output=await PDFDocument.load(await readFile('work/qa/precise-vector.pdf'));
+  const drawing=Buffer.from(decodePDFRawStream(output.getPage(0).node.Resources().lookup(n('XObject')).lookup(n('Artwork'))).decode()).toString('latin1');
+  const original=[1.123456,2.654321,3.987654,4.876543],actual=drawing.match(/([-\d.]+) ([-\d.]+) m\s+([-\d.]+) ([-\d.]+) l/).slice(1).map(Number);
+  assert.notDeepEqual(actual,original,'This fixture must exercise coordinate compaction');
+  for(let i=0;i<4;i++)assert.ok(Math.abs(actual[i]-original[i])*1000<=0.01,'The largest shared use determines vector precision');
+  assert.ok(drawing.includes('(Text \\(keeps\\) 9.123456 /Photo Do)'),'Literal text bytes must remain unchanged');
+});
+
+test('a failed form scan preserves its images but still downsamples unrelated photos',async()=>{
+  const doc=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=doc.getPage(0),n=PDFName.of;
+  const photo=p.node.Resources().lookup(n('XObject')).get(n('Photo'));
+  const other=doc.context.register(doc.context.lookup(photo).clone(doc.context));
+  const unknown=doc.context.register(doc.context.flateStream('q 0 0 cm /UnknownPhoto Do Q',{Type:'XObject',Subtype:'Form',BBox:[0,0,600,600],Resources:{XObject:{UnknownPhoto:other}}}));
+  p.node.setXObject(n('Unknown'),unknown);p.node.set(n('Contents'),doc.context.register(doc.context.flateStream('q 24 0 0 24 0 0 cm /Photo Do Q /Unknown Do')));
+  // Give the second image a distinct harmless dictionary entry so it cannot
+  // deduplicate with the known photo and become shared across uncertain uses.
+  doc.context.lookup(other).dict.set(n('Interpolate'),doc.context.obj(true));
+  files.set('/partial-scan.pdf',await doc.save());
+  await page.evaluate(async()=>{const r=await Crisp.compressPdf(new Uint8Array(await(await fetch('/partial-scan.pdf')).arrayBuffer()),{preset:'balanced'});await fetch('/save/partial-scan.pdf',{method:'POST',body:r.bytes});});
+  const output=await PDFDocument.load(await readFile('work/qa/partial-scan.pdf'));
+  const dimensions=output.context.enumerateIndirectObjects().map(([,o])=>o).filter(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image').map(o=>o.dict.lookup(n('Width')).asNumber()).sort((a,b)=>a-b);
+  assert.deepEqual(dimensions,[48,1024]);
+});
+
+test('components and instances appear in selection and export like frames after their fonts load',async()=>{
+  const mock=nativeStackMock(),loaded=[];mock.a.type='COMPONENT';mock.b.type='INSTANCE';
+  const regular={family:'Apis',style:'Regular'},bold={family:'Apis',style:'Bold'};
+  mock.figma.mixed=Symbol('mixed');
+  mock.a.findAllWithCriteria=()=>[{fontName:regular}];
+  mock.b.findAllWithCriteria=()=>[{fontName:mock.figma.mixed,getStyledTextSegments:()=>[{fontName:regular},{fontName:bold}]}];
+  mock.figma.loadFontAsync=async font=>{await new Promise(r=>setTimeout(r,2));loaded.push(font);};
+  const clone=mock.a.clone;mock.a.clone=()=>{assert.equal(loaded.length,2,'Load mixed and regular fonts before creating temporary copies');return clone();};
+  vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  assert.deepEqual(Array.from(mock.posted.find(m=>m.type==='selection').frames,f=>f.name),['a','b']);
+  await mock.message({type:'export',ids:['a','b'],requestId:18});
+  assert.equal(mock.calls.length,1);assert.deepEqual(loaded,[regular,bold]);assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
+});
+
+test('unavailable fonts and cancellation during font loading never create temporary artwork',async()=>{
+  for(const cancel of [false,true]){
+    const mock=nativeStackMock();let release;
+    mock.a.findAllWithCriteria=()=>[{fontName:{family:'Apis',style:'Bold'}}];
+    mock.figma.loadFontAsync=cancel?()=>new Promise(r=>release=r):async()=>{throw new Error('Unavailable');};
+    vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+    const pending=mock.message({type:'export',ids:['a','b'],requestId:19});
+    if(cancel){while(!release)await new Promise(r=>setTimeout(r,1));await mock.message({type:'cancel',requestId:19});release();}
+    await pending;
+    assert.equal(mock.calls.length,0);assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
+    assert.match(mock.posted.at(-1).message,cancel?/Cancelled/:/Apis Bold.*Install that font/);
+  }
+});
+
+
+test('cached form reuse has a finite traversal budget and preserves uncertain image resolution',async()=>{
+  const doc=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=doc.getPage(0),n=PDFName.of;
+  const photo=p.node.Resources().lookup(n('XObject')).get(n('Photo'));
+  let nested=doc.context.register(doc.context.flateStream('q 24 0 0 24 0 0 cm /Photo Do Q',{Type:'XObject',Subtype:'Form',BBox:[0,0,600,600],Resources:{XObject:{Photo:photo}}}));
+  for(let i=0;i<18;i++)nested=doc.context.register(doc.context.flateStream('/Nested Do /Nested Do',{Type:'XObject',Subtype:'Form',BBox:[0,0,600,600],Resources:{XObject:{Nested:nested}}}));
+  p.node.setXObject(n('Repeated'),nested);p.node.set(n('Contents'),doc.context.register(doc.context.flateStream('/Repeated Do')));files.set('/repeated-forms.pdf',await doc.save());
+  await page.evaluate(async()=>{const r=await Crisp.compressPdf(new Uint8Array(await(await fetch('/repeated-forms.pdf')).arrayBuffer()),{preset:'balanced'});await fetch('/save/repeated-forms.pdf',{method:'POST',body:r.bytes});});
+  const output=await PDFDocument.load(await readFile('work/qa/repeated-forms.pdf'));
+  const image=output.context.enumerateIndirectObjects().map(([,o])=>o).find(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image');
+  assert.equal(image.dict.lookup(n('Width')).asNumber(),1024);
 });

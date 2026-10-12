@@ -1,3 +1,7 @@
+type ExportableNode = FrameNode | ComponentNode | InstanceNode;
+function isExportable(node: BaseNode): node is ExportableNode {
+  return node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE';
+}
 const MAX_FRAMES = 300;
 const MAX_BYTES = 200 * 1024 * 1024;
 let exporting = false;
@@ -26,9 +30,25 @@ figma.showUI(__html__, { width: 440, height: 740, themeColors: true });
 // ID-less development imports cannot use Figma's relaunch or persistent storage APIs.
 if (figma.pluginId) figma.root.setRelaunchData({ open: 'Export selected frames as a compressed PDF' });
 
-function frames(): FrameNode[] {
-  return figma.currentPage.selection.filter((node): node is FrameNode => node.type === 'FRAME' && node !== temporaryExport);
+function frames(): ExportableNode[] {
+  return figma.currentPage.selection.filter((node): node is ExportableNode => isExportable(node) && node !== temporaryExport);
 }
+async function loadExportFonts(nodes: ExportableNode[]) {
+  const fonts = new Map<string, FontName>();
+  for (const node of nodes) {
+    for (const text of node.findAllWithCriteria({ types: ['TEXT'] })) {
+      const font = text.fontName;
+      const names = font === figma.mixed ? text.getStyledTextSegments(['fontName']).map(segment => segment.fontName) : [font];
+      for (const name of names) fonts.set(JSON.stringify(name), name);
+    }
+  }
+  await Promise.all([...fonts.values()].map(async font => {
+    try { await figma.loadFontAsync(font); }
+    catch { throw new Error(`Figma could not load ${font.family} ${font.style}. Install that font and try again.`); }
+  }));
+  checkExport();
+}
+
 function selection() {
   const nodes = frames();
   post({ type: 'selection', frames: nodes.map(n => ({ id: n.id, name: n.name })), ignored: figma.currentPage.selection.length - nodes.length });
@@ -82,12 +102,12 @@ async function onMessage(msg: Message) {
     try {
       const ids = msg.ids || [];
       if (!Array.isArray(ids) || !ids.length || ids.length > MAX_FRAMES || ids.some(id => typeof id !== 'string' || !id) || new Set(ids).size !== ids.length) throw new Error('Choose 1–300 unique frames.');
-      const nodes: FrameNode[] = [];
+      const nodes: ExportableNode[] = [];
       for (const id of ids) {
         checkExport();
         const node = await figma.getNodeByIdAsync(id);
         checkExport();
-        if (!node || node.type !== 'FRAME' || node.parent?.type === 'DOCUMENT') throw new Error('A selected frame is no longer available. Select the frames again.');
+        if (!node || !isExportable(node) || node.parent?.type === 'DOCUMENT') throw new Error('A selected frame is no longer available. Select the frames again.');
         let ancestor: BaseNode | null = node;
         while (ancestor && ancestor.type !== 'PAGE') ancestor = ancestor.parent;
         if (ancestor !== figma.currentPage) throw new Error('Export frames from the current page.');
@@ -101,6 +121,7 @@ async function onMessage(msg: Message) {
         post({ type: 'export-progress', requestId, index: 0, count: 1, name: nodes[0].name });
         bytes = await nodes[0].exportAsync({ format: 'PDF', contentsOnly: true, useAbsoluteBounds: true });
       } else {
+        await loadExportFonts(nodes);
         const snapshots = nodes.map(node => {
           const bounds = node.absoluteBoundingBox;
           if (!bounds || bounds.width <= 0 || bounds.height <= 0) throw new Error('A selected frame has invalid bounds.');

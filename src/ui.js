@@ -138,7 +138,7 @@ window.addEventListener('message', async e => {
     // Refresh metadata while preserving the user's manual order for frames still selected.
     frames = [...frames.filter(f=>byId.has(f.id)).map(f=>byId.get(f.id)), ...selected.filter(f=>!frames.some(old=>old.id===f.id))];
     if (!busy && old !== frames.map(f=>f.id).join('|')) clearResult();
-    $('ignored').hidden = !msg.ignored; $('ignored').textContent = `${msg.ignored} selected layers skipped. Select frames to export.`; drawFrames();
+    $('ignored').hidden = !msg.ignored; $('ignored').textContent = `${msg.ignored} selected layers skipped. Select frames or components to export.`; drawFrames();
     if (!busy) status(frames.length > LIMITS.pages ? 'Select no more than 300 frames.' : frames.length ? `${frames.length} ${frames.length===1?'frame':'frames'} ready.` : 'Select frames in Figma.');
   } else if (msg.type === 'selection-error') {
     if (!busy) status(msg.message,true);

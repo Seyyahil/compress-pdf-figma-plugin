@@ -3,10 +3,10 @@ import pako from 'pako';
 
 export const LIMITS = { bytes: 200 * 1024 * 1024, pages: 300, pixels: 40_000_000, objects: 200_000 };
 export const PRESETS = {
-  smallest: { dpi: 96, quality: 0.65, lossy: true },
-  balanced: { dpi: 144, quality: 0.82, lossy: true },
-  print: { dpi: 300, quality: 0.94, lossy: true },
-  lossless: { dpi: 0, quality: 1, lossy: false },
+  smallest: { dpi: 96, quality: 0.65, lossy: true, vectorTolerance: 0.02 },
+  balanced: { dpi: 144, quality: 0.82, lossy: true, vectorTolerance: 0.01 },
+  print: { dpi: 300, quality: 0.94, lossy: true, vectorTolerance: 0.001 },
+  lossless: { dpi: 0, quality: 1, lossy: false, vectorTolerance: 0 },
 };
 const N = (s) => PDFName.of(s);
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -76,100 +76,179 @@ function rawPixels(s, channels) {
   return undoPredictor(data, w, h, channels, params(s));
 }
 const mul = (a, b) => [a[0]*b[0]+a[2]*b[1], a[1]*b[0]+a[3]*b[1], a[0]*b[2]+a[2]*b[3], a[1]*b[2]+a[3]*b[3], a[0]*b[4]+a[2]*b[5]+a[4], a[1]*b[4]+a[3]*b[5]+a[5]];
-// Tokenize content streams without treating literal strings or hex strings as operators.
-function* tokens(text) {
-  let i = 0;
-  while (i < text.length) {
-    const c = text[i];
-    if (/[\x00\t\n\f\r ]/.test(c)) { i++; continue; }
-    if (c === '%') { while (i < text.length && !/[\r\n]/.test(text[i])) i++; continue; }
-    if (c === '(') { let depth = 1; i++; while (i < text.length && depth) { if (text[i] === '\\') i += 2; else { if (text[i] === '(') depth++; if (text[i] === ')') depth--; i++; } } yield '(string)'; continue; }
-    if (c === '<' && text[i + 1] !== '<') { while (i < text.length && text[i] !== '>') i++; i++; yield '<hex>'; continue; }
-    if ('[]<>'.includes(c)) { i++; yield c; continue; }
-    const start = i++;
-    while (i < text.length && !/[\x00\t\n\f\r ()[\]<>/%]/.test(text[i])) i++;
-    yield text.slice(start, i);
+// Decode drawing streams incrementally: long Figma pages must not allocate a
+// second, enormous PDF in memory just to inspect or recompress their commands.
+const CONTENT_LIMIT = 256 * 1024 * 1024;
+async function visitContent(stream, visit, signal) {
+  if (!(stream instanceof PDFRawStream) || params(stream)) throw new Error('Unsupported content stream');
+  const filter = filterName(stream), bytes = stream.getContents();
+  let size = 0;
+  const consume = chunk => {
+    size += chunk.length;
+    if (size > CONTENT_LIMIT) throw new Error('Content stream too large');
+    check(signal); visit(chunk);
+  };
+  if (!filter) {
+    for (let i = 0; i < bytes.length; i += 65536) { consume(bytes.subarray(i, i + 65536)); if (i % 1048576 === 0) await tick(); }
+  } else if (filter === 'FlateDecode') {
+    const inflate = new pako.Inflate({ chunkSize: 65536, windowBits: 15 });
+    inflate.onData = consume;
+    for (let i = 0; i < bytes.length; i += 16384) {
+      check(signal);
+      if (!inflate.push(bytes.subarray(i, i + 16384), i + 16384 >= bytes.length)) throw new Error('Invalid compressed content');
+      if (i % 262144 === 0) await tick();
+      if (inflate.ended) break;
+    }
+    if (!inflate.ended || inflate.err) throw new Error('Truncated compressed content');
+  } else {
+    if (bytes.length > 1_000_000) throw new Error('Unsupported large content encoding');
+    consume(decodePDFRawStream(stream).decode());
   }
 }
-function decodedContent(context, object) {
-  object = context.lookup(object);
-  if (!object) return '';
-  if (object instanceof PDFArray) return object.asArray().map(o => decodedContent(context, o)).join('\n');
-  if (!(object instanceof PDFRawStream) || object.getContentsSize() > 16_000_000 || params(object)) throw new Error('Unsupported content stream');
-  const b = decodePDFRawStream(object).decode();
-  if (b.length > 32_000_000) throw new Error('Content stream too large');
-  // PDF tokens contain byte-valued names. TextDecoder's "latin1" uses
-  // Windows-1252 and changes bytes 0x80-0x9f into different characters.
-  const chunks = [];
-  for (let i = 0; i < b.length; i += 32768) chunks.push(String.fromCharCode(...b.subarray(i, i + 32768)));
-  return chunks.join('');
+const whitespace = c => c === 0 || c === 9 || c === 10 || c === 12 || c === 13 || c === 32;
+const delimiter = c => whitespace(c) || c === 40 || c === 41 || c === 60 || c === 62 || c === 91 || c === 93 || c === 47 || c === 37;
+const numeric = t => /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(t);
+function contentLexer(emit) {
+  let value = '', state = '', depth = 0, escaped = false;
+  function flush() { if (value) emit(value); value = ''; state = ''; }
+  return {
+    push(bytes) {
+      for (let i = 0; i < bytes.length; i++) {
+        const code = bytes[i], c = String.fromCharCode(code);
+        if (state === 'comment') { if (code === 10 || code === 13) state = ''; continue; }
+        if (state === 'literal') {
+          value += c;
+          if (escaped) escaped = false;
+          else if (code === 92) escaped = true;
+          else if (code === 40) depth++;
+          else if (code === 41 && --depth === 0) flush();
+        } else if (state === 'hex') { value += c; if (code === 62) flush(); }
+        else if (state === 'angle') {
+          if (c === value) { value += c; flush(); }
+          else if (value === '<') { state = 'hex'; value += c; if (code === 62) flush(); }
+          else { flush(); i--; }
+        } else if (state === 'token' && !delimiter(code)) value += c;
+        else {
+          flush();
+          if (whitespace(code)) continue;
+          if (code === 37) state = 'comment';
+          else if (code === 40) { state = 'literal'; value = c; depth = 1; }
+          else if (code === 60 || code === 62) { state = 'angle'; value = c; }
+          else if (code === 91 || code === 93 || code === 41) emit(c);
+          else { state = 'token'; value = c; }
+        }
+        if (value.length > 1_000_000) throw new Error('Content token too large');
+      }
+    },
+    finish() {
+      if (state === 'literal' || state === 'hex' || state === 'angle' && value === '<') throw new Error('Incomplete drawing token');
+      flush();
+    },
+  };
 }
-function placements(doc) {
-  const usage = new Map(); let operations = 0;
+const norm = m => Math.max(Math.abs(m[0]) + Math.abs(m[2]), Math.abs(m[1]) + Math.abs(m[3]));
+function graphicsState() {
+  const identity = [1,0,0,1,0,0], stack = []; let matrix = identity;
+  return {
+    get matrix() { return matrix; },
+    operator(token, operands) {
+      if (token === 'q') { if (stack.length >= 256) throw new Error('Graphics state depth limit'); stack.push(matrix); }
+      else if (token === 'Q') { if (!stack.length) throw new Error('Unbalanced graphics state'); matrix = stack.pop(); }
+      else if (token === 'cm') {
+        if (operands.length !== 6 || !operands.every(numeric)) throw new Error('Invalid drawing transform');
+        matrix = mul(matrix, operands.map(Number));
+        if (!matrix.every(Number.isFinite)) throw new Error('Invalid drawing transform');
+      }
+    },
+  };
+}
+async function placements(doc, signal) {
+  const usage = new Map(), gains = new Map(), cache = new Map(); let operations = 0, traversals = 0;
   const context = doc.context;
-  function containsImage(root) {
-    const visited = new Set(), pending = [root];
+  const resolve = o => context.lookup(o);
+  function reachableImages(root) {
+    const found = new Set(), visited = new Set(), pending = [root];
     while (pending.length) {
-      const object = context.lookup(pending.pop());
+      const object = resolve(pending.pop());
       if (!object || visited.has(object)) continue;
       visited.add(object);
-      if (isImage(object)) return true;
-      if (object instanceof PDFRawStream) pending.push(object.dict);
+      if (isImage(object)) found.add(object);
+      else if (object instanceof PDFRawStream) { if (named(object.dict,'Subtype') === 'Form') found.add(object); pending.push(object.dict); }
       else if (object instanceof PDFDict) for (const [,value] of object.entries()) pending.push(value);
       else if (object instanceof PDFArray) pending.push(...object.asArray());
     }
-    return false;
+    return found;
   }
-  function scan(text, resources, initial, path, depth) {
-    if (depth > 16) throw new Error('Placement scan depth limit');
-    if (!(resources instanceof PDFDict)) return;
-    const xobjects = resources.lookup(N('XObject'));
-    if (!(xobjects instanceof PDFDict)) return;
-    const stack = [], operands = []; let matrix = initial.slice();
-    for (const t of tokens(text)) {
-      if (++operations > 16_000_000) throw new Error('Placement scan limit');
+  const uncertain = new Set();
+  function preserve(root) { for (const image of reachableImages(root)) uncertain.add(image); }
+  async function summary(stream) {
+    if (cache.has(stream)) return cache.get(stream);
+    const calls = [], operands = [], state = graphicsState();
+    const lexer = contentLexer(t => {
+      if (++operations > 64_000_000) throw new Error('Placement scan limit');
       if (t === 'BI') throw new Error('Inline images have untracked placements');
-      if (t[0] === '/' || /^[-+]?\d*\.?\d+$/.test(t)) { operands.push(t); if (operands.length > 64) operands.shift(); continue; }
-      if (t === 'q') stack.push(matrix.slice());
-      else if (t === 'Q') matrix = stack.pop() || initial.slice();
-      else if (t === 'cm' && operands.length >= 6) { const m = operands.slice(-6).map(Number); if (m.every(Number.isFinite)) matrix = mul(matrix, m); }
-      else if (t === 'Do' && operands.length) {
-        const key = operands.at(-1);
-        if (key[0] === '/') {
-          const ref = xobjects.get(N(key.slice(1).replace(/#([\da-f]{2})/gi, (_, x) => String.fromCharCode(parseInt(x, 16)))));
-          const object = context.lookup(ref);
-          if (isImage(object)) {
-            const id = ref instanceof PDFRef ? ref.toString() : object;
-            const old = usage.get(id) || { width: 0, height: 0 };
-            old.width = Math.max(old.width, Math.hypot(matrix[0], matrix[1]));
-            old.height = Math.max(old.height, Math.hypot(matrix[2], matrix[3]));
-            usage.set(id, old);
-          } else if (object instanceof PDFRawStream && named(object.dict, 'Subtype') === 'Form') {
-            if (path.has(object)) throw new Error('Cyclic form placement');
-            const fm = object.dict.lookup(N('Matrix'));
-            const formMatrix = fm instanceof PDFArray ? fm.asArray().map(n => context.lookup(n)).map(n => n instanceof PDFNumber ? n.asNumber() : NaN) : [1,0,0,1,0,0];
-            if (formMatrix.length !== 6 || !formMatrix.every(Number.isFinite)) throw new Error('Invalid form transform');
-            path.add(object);
-            try { scan(decodedContent(context, object), object.dict.lookup(N('Resources')) || resources, mul(matrix, formMatrix), path, depth + 1); } finally { path.delete(object); }
-          }
-        }
+      if (t[0] === '/' || numeric(t)) { operands.push(t); if (operands.length > 64) operands.shift(); return; }
+      state.operator(t, operands);
+      if (t === 'Do') {
+        if (operands.length !== 1 || operands[0][0] !== '/' || calls.length >= 100_000) throw new Error('Invalid object placement');
+        calls.push({ name: operands[0].slice(1).replace(/#([\da-f]{2})/gi, (_,x) => String.fromCharCode(parseInt(x,16))), matrix: state.matrix });
       }
       operands.length = 0;
+    });
+    try {
+      const streams = stream instanceof PDFArray ? stream.asArray().map(resolve) : [stream];
+      for (const part of streams) { await visitContent(part, bytes => lexer.push(bytes), signal); lexer.push(new Uint8Array([10])); }
+      lexer.finish(); cache.set(stream, calls);
     }
+    catch (error) { check(signal); cache.set(stream, null); return null; }
+    return calls;
   }
-  // Figma's vector glyph fonts are Type 3. They do not invalidate unrelated
-  // image placements unless their glyph resources actually contain images.
-  let complete = !doc.context.enumerateIndirectObjects().some(([,o]) => o instanceof PDFDict && (
-    (o.has(N('Pattern')) && containsImage(o.get(N('Pattern')))) ||
-    (o.has(N('AP')) && containsImage(o.get(N('AP')))) ||
-    (named(o, 'Subtype') === 'Type3' && (containsImage(o.get(N('Resources'))) || containsImage(o.get(N('CharProcs')))))
-  ));
+  async function walk(root, resources, initial, path, depth) {
+    check(signal);
+    if (++traversals > 200_000) { preserve(resources); return; }
+    const stream = resolve(root);
+    if (!stream) return;
+    if (stream instanceof PDFArray && stream.size() === 1) return walk(stream.get(0), resources, initial, path, depth);
+    if (!(stream instanceof PDFRawStream || stream instanceof PDFArray) || depth > 32 || path.has(stream)) { preserve(resources); return; }
+    if (stream instanceof PDFRawStream) gains.set(stream, Math.max(gains.get(stream) || 0, norm(initial)));
+    const calls = await summary(stream);
+    if (!calls) { gains.delete(stream); preserve(resources); return; }
+    const xobjects = resources instanceof PDFDict ? resources.lookup(N('XObject')) : null;
+    if (!(xobjects instanceof PDFDict)) return;
+    path.add(stream);
+    try {
+      for (const call of calls) {
+        check(signal);
+        if (traversals >= 200_000) { preserve(resources); return; }
+        const ref = xobjects.get(N(call.name)), object = resolve(ref), matrix = mul(initial, call.matrix);
+        if (isImage(object)) {
+          const id = ref instanceof PDFRef ? ref.toString() : object, old = usage.get(id) || { width: 0, height: 0 };
+          old.width = Math.max(old.width, Math.hypot(matrix[0], matrix[1]));
+          old.height = Math.max(old.height, Math.hypot(matrix[2], matrix[3])); usage.set(id, old);
+        } else if (object instanceof PDFRawStream && named(object.dict,'Subtype') === 'Form') {
+          const fm = object.dict.lookup(N('Matrix'));
+          const transform = fm instanceof PDFArray ? fm.asArray().map(v => resolve(v)).map(v => v instanceof PDFNumber ? v.asNumber() : NaN) : [1,0,0,1,0,0];
+          const childResources = object.dict.lookup(N('Resources')) || resources;
+          if (transform.length !== 6 || !transform.every(Number.isFinite)) preserve(childResources);
+          else await walk(object, childResources, mul(matrix, transform), path, depth + 1);
+        }
+      }
+    } finally { path.delete(stream); }
+  }
+  // Untracked uses retain resolution even when that image also has a small,
+  // known use elsewhere. Unrelated images can still be downsampled safely.
+  for (const [,o] of context.enumerateIndirectObjects()) if (o instanceof PDFDict) {
+    if (o.has(N('Pattern'))) preserve(o.get(N('Pattern')));
+    if (o.has(N('AP'))) preserve(o.get(N('AP')));
+    if (named(o,'Subtype') === 'Type3') { preserve(o.get(N('Resources'))); preserve(o.get(N('CharProcs'))); }
+  }
   for (const page of doc.getPages()) {
-    const unit = num(page.node, 'UserUnit', 1);
-    try { scan(decodedContent(context, page.node.get(N('Contents'))), page.node.Resources(), [unit,0,0,unit,0,0], new Set(), 0); } catch { complete = false; }
+    const unit = num(page.node,'UserUnit',1);
+    await walk(page.node.get(N('Contents')), page.node.Resources(), [unit,0,0,unit,0,0], new Set(), 0);
   }
-  // Failed scans cannot establish the largest use of a shared image. Keep its resolution.
-  return complete ? usage : new Map();
+  for (const [id] of usage) if (uncertain.has(resolve(typeof id === 'string' ? PDFRef.of(Number(id.split(' ')[0]),Number(id.split(' ')[1])) : id))) usage.delete(id);
+  for (const stream of uncertain) gains.delete(stream);
+  return { usage, gains };
 }
 function photoLike(data) {
   const colors = new Set(), step = Math.max(4, Math.floor(data.length / 4096 / 4) * 4);
@@ -248,22 +327,69 @@ async function loadPdf(bytes) {
   if (hasSignature(doc)) throw new Error('Could not process a digitally signed frame export.');
   return doc;
 }
-async function reflate(doc, signal) {
+async function compressedContent(stream, signal, gain, tolerance) {
+  const deflate = new pako.Deflate({ level: 9 }), chunks = []; let size = 0;
+  deflate.onData = bytes => {
+    size += bytes.length;
+    if (size > stream.getContentsSize()) throw new Error('Recompressed stream is larger');
+    chunks.push(bytes);
+  };
+  const write = bytes => { if (!deflate.push(bytes, false)) throw new Error('Content encoding failed'); };
+  let lexer;
+  if (gain > 0 && Number.isFinite(gain) && tolerance > 0) {
+    const state = graphicsState(), operands = []; let output = '', nesting = 0;
+    const flush = () => {
+      const bytes = new Uint8Array(output.length);
+      for (let i = 0; i < output.length; i++) bytes[i] = output.charCodeAt(i);
+      write(bytes); output = '';
+    };
+    lexer = contentLexer(t => {
+      if (t === 'BI') throw new Error('Inline image content preserved');
+      if (t === '[' || t === '<<') nesting++;
+      if (t === ']' || t === '>>') nesting--;
+      if (nesting || numeric(t) || t[0] === '/' || t[0] === '(' || t[0] === '<' || t === ']' || t === '>>') {
+        operands.push(t);
+        if (operands.length > 4096) throw new Error('Drawing operand limit');
+        return;
+      }
+      const count = { m:2, l:2, c:6, v:4, y:4, re:4 }[t];
+      if (count && operands.length === count && operands.every(numeric)) {
+        // Account for every use of a shared form and its current transform.
+        // Rectangles add a position and a width, hence a full decimal quantum
+        // (rather than half) bounds the error in PDF page points.
+        const scale = gain * norm(state.matrix), precision = Math.max(0, Math.ceil(Math.log10(scale / tolerance)));
+        if (Number.isFinite(precision) && precision <= 9) for (let i = 0; i < operands.length; i++) {
+          const value = Number(operands[i]);
+          if (Number.isFinite(value) && Math.abs(value) < 1e15) operands[i] = value.toFixed(precision).replace(/(\.\d*?)0+$/,'$1').replace(/\.$/,'');
+        }
+      }
+      state.operator(t, operands);
+      output += (operands.length ? operands.join(' ') + ' ' : '') + t + '\n'; operands.length = 0;
+      if (output.length >= 65536) flush();
+    });
+    await visitContent(stream, bytes => lexer.push(bytes), signal);
+    lexer.finish();
+    if (operands.length || nesting) throw new Error('Incomplete drawing commands');
+    if (output) flush();
+  } else await visitContent(stream, write, signal);
+  if (!deflate.push(new Uint8Array(), true) || deflate.err) throw new Error('Content encoding failed');
+  const data = new Uint8Array(size); let offset = 0;
+  for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+  return data;
+}
+async function reflate(doc, signal, gains, tolerance) {
   let count = 0, i = 0;
   for (const [ref, o] of doc.context.enumerateIndirectObjects()) {
     check(signal);
-    if (o instanceof PDFRawStream && !isImage(o) && !params(o) && ['', 'FlateDecode', 'LZWDecode', 'ASCII85Decode', 'ASCIIHexDecode'].includes(filterName(o)) && o.getContentsSize() < 16_000_000) {
+    if (o instanceof PDFRawStream && !isImage(o) && !params(o) && ['', 'FlateDecode', 'LZWDecode', 'ASCII85Decode', 'ASCIIHexDecode'].includes(filterName(o))) {
       try {
-        const decoded = decodePDFRawStream(o).decode();
-        if (decoded.length <= 32_000_000) {
-          const data = pako.deflate(decoded, { level: 9 });
-          if (data.length < o.getContentsSize() - 32) {
-            const d = cloneDict(o.dict);
-            d.delete(N('DecodeParms')); d.delete(N('Length')); d.set(N('Filter'), N('FlateDecode'));
-            doc.context.assign(ref, PDFRawStream.of(d, data)); count++;
-          }
+        const data = await compressedContent(o, signal, gains.get(o), tolerance);
+        if (data.length < o.getContentsSize() - 32) {
+          const d = cloneDict(o.dict);
+          d.delete(N('DecodeParms')); d.delete(N('Length')); d.set(N('Filter'), N('FlateDecode'));
+          doc.context.assign(ref, PDFRawStream.of(d, data)); count++;
         }
-      } catch { /* Unknown encodings stay intact. */ }
+      } catch { check(signal); /* Unsupported or over-budget streams stay intact. */ }
     }
     if (++i % 50 === 0) await tick();
   }
@@ -328,7 +454,7 @@ async function pass(bytes, settings, progress, signal) {
     }
   }
   progress({ phase: 'Inspecting image resolution', value: 0.09 }); await tick();
-  const use = placements(doc), images = doc.context.enumerateIndirectObjects().filter(([,o]) => isImage(o) && !masks.has(o));
+  const { usage: use, gains } = await placements(doc, signal), images = doc.context.enumerateIndirectObjects().filter(([,o]) => isImage(o) && !masks.has(o));
   let optimized = 0, skipped = 0;
   for (let i = 0; i < images.length; i++) {
     check(signal); const [ref,o] = images[i];
@@ -336,7 +462,7 @@ async function pass(bytes, settings, progress, signal) {
     try { if (await optimizeImage(doc, ref, o, settings, use.get(ref.toString()))) optimized++; else skipped++; } catch { skipped++; }
     await tick();
   }
-  progress({ phase: 'Compressing PDF streams', value: 0.78 }); const streams = await reflate(doc, signal);
+  progress({ phase: 'Compressing PDF streams', value: 0.78 }); const streams = await reflate(doc, signal, gains, settings.vectorTolerance);
   progress({ phase: 'Reusing identical resources', value: 0.85 }); const duplicates = shared + await deduplicate(doc, signal), removed = unused + prune(doc);
   check(signal); progress({ phase: 'Writing optimized PDF', value: 0.92 });
   const out = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 40 });
