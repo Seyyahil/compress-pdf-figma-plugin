@@ -10,14 +10,8 @@ let acknowledge: (() => void) | null = null;
 let activeRequest: number | undefined;
 let pendingIndex = -1;
 let sessionPreferences: unknown;
-let temporaryExport: FrameNode | null = null;
 let queuedExport: Message | null = null;
 let closed = false;
-function clearTemporaryExport() {
-  const node = temporaryExport;
-  temporaryExport = null;
-  if (node && !node.removed) node.remove();
-}
 
 function post(message: unknown) {
   if (!closed) figma.ui.postMessage(message);
@@ -31,22 +25,7 @@ figma.showUI(__html__, { width: 440, height: 740, themeColors: true });
 if (figma.pluginId) figma.root.setRelaunchData({ open: 'Export selected frames as a compressed PDF' });
 
 function frames(): ExportableNode[] {
-  return figma.currentPage.selection.filter((node): node is ExportableNode => isExportable(node) && node !== temporaryExport);
-}
-async function loadExportFonts(nodes: ExportableNode[]) {
-  const fonts = new Map<string, FontName>();
-  for (const node of nodes) {
-    for (const text of node.findAllWithCriteria({ types: ['TEXT'] })) {
-      const font = text.fontName;
-      const names = font === figma.mixed ? text.getStyledTextSegments(['fontName']).map(segment => segment.fontName) : [font];
-      for (const name of names) fonts.set(JSON.stringify(name), name);
-    }
-  }
-  await Promise.all([...fonts.values()].map(async font => {
-    try { await figma.loadFontAsync(font); }
-    catch { throw new Error(`Figma could not load ${font.family} ${font.style}. Install that font and try again.`); }
-  }));
-  checkExport();
+  return figma.currentPage.selection.filter((node): node is ExportableNode => isExportable(node));
 }
 
 function selection() {
@@ -113,78 +92,31 @@ async function onMessage(msg: Message) {
         if (ancestor !== figma.currentPage) throw new Error('Export frames from the current page.');
         nodes.push(node);
       }
-      // Export the complete stack once so Figma can share fonts, images and masks.
-      // Independent per-frame PDFs can repeat those resources before compression.
-      let bytes: Uint8Array;
-      checkExport();
-      if (nodes.length === 1) {
-        post({ type: 'export-progress', requestId, index: 0, count: 1, name: nodes[0].name });
-        bytes = await nodes[0].exportAsync({ format: 'PDF', contentsOnly: true, useAbsoluteBounds: true });
-      } else {
-        await loadExportFonts(nodes);
-        const snapshots = nodes.map(node => {
-          const bounds = node.absoluteBoundingBox;
-          if (!bounds || bounds.width <= 0 || bounds.height <= 0) throw new Error('A selected frame has invalid bounds.');
-          return { node, bounds, transform: node.absoluteTransform, modes: node.resolvedVariableModes };
-        });
-        const width = Math.max(...snapshots.map(s => s.bounds.width));
-        const height = snapshots.reduce((sum, s) => sum + s.bounds.height, 0);
-        // Native PDF export supports pages taller than 100,000 px. Validate
-        // dimensions without imposing an unrelated raster/frame-size ceiling.
-        if (!Number.isFinite(width) || !Number.isFinite(height)) throw new Error('The combined page has invalid bounds.');
-        const stack = figma.createFrame();
-        temporaryExport = stack;
-        stack.name = 'Compress PDF · temporary export';
-        stack.fills = []; stack.strokes = []; stack.effects = []; stack.clipsContent = true;
-        stack.resizeWithoutConstraints(width, height); stack.x = -1000000; stack.y = 0;
-        stack.locked = true;
-        const collections = new Map<string, VariableCollection>();
-        let top = 0;
-        for (let i = 0; i < snapshots.length; i++) {
-          checkExport();
-          const { node, bounds, transform, modes } = snapshots[i];
-          post({ type: 'export-progress', requestId, index: i, count: nodes.length, name: node.name });
-          const viewport = figma.createFrame(); stack.appendChild(viewport);
-          viewport.fills = []; viewport.strokes = []; viewport.effects = []; viewport.clipsContent = true;
-          viewport.resizeWithoutConstraints(bounds.width, bounds.height); viewport.x = 0; viewport.y = top;
-          const copy = node.clone();
-          try { viewport.appendChild(copy); }
-          catch (error) { copy.remove(); throw error; }
-          // Preserve the source's absolute orientation and inherited variable modes.
-          copy.relativeTransform = [[transform[0][0], transform[0][1], transform[0][2] - bounds.x], [transform[1][0], transform[1][1], transform[1][2] - bounds.y]];
-          for (const [id, mode] of Object.entries(modes)) {
-            if (copy.resolvedVariableModes[id] === mode) continue;
-            let collection = collections.get(id);
-            if (!collection) {
-              const found = await figma.variables.getVariableCollectionByIdAsync(id);
-              checkExport();
-              if (!found) throw new Error('A variable collection used by a selected frame is unavailable.');
-              collection = found; collections.set(id, collection);
-            }
-            copy.setExplicitVariableModeForCollection(collection, mode);
-          }
-          top += bounds.height;
-        }
+      let totalBytes = 0;
+      for (let i = 0; i < nodes.length; i++) {
         checkExport();
-        bytes = await stack.exportAsync({ format: 'PDF', contentsOnly: true, useAbsoluteBounds: true });
+        const node = nodes[i];
+        post({ type: 'export-progress', requestId, index: i, count: nodes.length, name: node.name });
+        // Each native export is one page. Export originals directly to preserve
+        // their fonts, variables, dimensions and orientation without cloning.
+        const bytes = await node.exportAsync({ format: 'PDF', contentsOnly: true, useAbsoluteBounds: true });
+        checkExport();
+        totalBytes += bytes.length;
+        if (totalBytes > MAX_BYTES) throw new Error('The native exports exceed 200 MiB. Export fewer frames.');
+        await new Promise<void>((resolve, reject) => {
+          pendingIndex = i;
+          const timeout = setTimeout(() => { acknowledge = null; reject(new Error('The PDF panel stopped responding. Reopen the plugin.')); }, 30000);
+          acknowledge = () => { clearTimeout(timeout); acknowledge = null; resolve(); };
+          try { post({ type: 'frame-pdf', requestId, index: i, count: nodes.length, bytes }); }
+          catch (error) { clearTimeout(timeout); acknowledge = null; reject(error); }
+        });
+        checkExport();
       }
-      checkExport();
-      if (bytes.length > MAX_BYTES) throw new Error('The native export exceeds 200 MiB. Export fewer frames.');
-      // Remove temporary artwork before delivering the PDF to the panel.
-      clearTemporaryExport();
-      await new Promise<void>((resolve, reject) => {
-        pendingIndex = 0;
-        const timeout = setTimeout(() => { acknowledge = null; reject(new Error('The PDF panel stopped responding. Reopen the plugin.')); }, 30000);
-        acknowledge = () => { clearTimeout(timeout); acknowledge = null; resolve(); };
-        try { post({ type: 'frame-pdf', requestId, index: 0, count: 1, bytes }); }
-        catch (error) { clearTimeout(timeout); acknowledge = null; reject(error); }
-      });
-      checkExport();
       post({ type: 'export-complete', requestId });
     } catch (error) {
       post({ type: 'export-error', requestId, message: error instanceof Error ? error.message : String(error) });
     } finally {
-      clearTemporaryExport(); exporting = false; acknowledge = null; activeRequest = undefined; pendingIndex = -1;
+      exporting = false; acknowledge = null; activeRequest = undefined; pendingIndex = -1;
       const next = queuedExport; queuedExport = null;
       if (next && !closed) void onMessage(next);
     }
@@ -192,7 +124,7 @@ async function onMessage(msg: Message) {
 }
 figma.ui.onmessage = onMessage;
 figma.on('close', () => {
-  closed = true; cancelled = true; queuedExport = null; acknowledge?.(); clearTemporaryExport();
+  closed = true; cancelled = true; queuedExport = null; acknowledge?.();
 });
 figma.on('selectionchange', () => { void sendSelection(); });
 figma.on('currentpagechange', () => { void sendSelection(); });

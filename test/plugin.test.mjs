@@ -19,20 +19,21 @@ before(async()=>{
   const send=m=>document.getElementById('plugin').contentWindow.postMessage({pluginMessage:m},'*');
   window.addEventListener('message',async e=>{const m=e.data.pluginMessage;if(!m)return;
   if(m.type==='ready')send({type:'selection',frames:[{id:'1:1',name:'Frame A',width:900,height:700,x:0,y:0},{id:'1:2',name:'Frame B',width:900,height:700,x:950,y:0}],ignored:0});
-  if(m.type==='export'){const bytes=new Uint8Array(await(await fetch(m.ids[0]==='1:1'?'/stack-ab.pdf':'/stack-ba.pdf')).arrayBuffer());send({type:'frame-pdf',requestId:m.requestId,index:0,count:1,bytes});send({type:'export-complete',requestId:m.requestId});}}
+  if(m.type==='export'){for(const [index,id] of m.ids.entries()){const bytes=new Uint8Array(await(await fetch(id==='1:2'?'/frame-b.pdf':'/frame-a.pdf')).arrayBuffer());send({type:'frame-pdf',requestId:m.requestId,index,count:m.ids.length,bytes});}send({type:'export-complete',requestId:m.requestId});}}
+
   );</script>`));
   files.set('/blocked-host.html',Buffer.from(files.get('/host.html').toString().replace('src="/ui.html"','src="/blocked-ui.html"')));
   files.set('/blocked-ui.html',files.get('/ui.html'));
   files.set('/relay-host.html',Buffer.from(files.get('/host.html').toString().replace('name="plugin" id="plugin" src="/ui.html"','name="bridge" id="plugin" src="/relay-bridge.html"').replace("document.getElementById('plugin').contentWindow.postMessage", "document.getElementById('plugin').contentWindow.frames[0].postMessage")));
   files.set('/relay-bridge.html',Buffer.from(`<!doctype html><style>body{margin:0}iframe{width:100vw;height:100vh;border:0}</style><iframe name="plugin" src="/ui.html"></iframe><script>window.addEventListener('message',e=>{if(e.data.pluginMessage)parent.postMessage(e.data,'*');});</script>`));
-  files.set('/live-host.html',Buffer.from(files.get('/host.html').toString().replace("if(m.type==='export'){const bytes", "if(m.type==='export'){window.lastExportIds=m.ids;await new Promise(r=>window.finishExport=r);const bytes")));
+  files.set('/live-host.html',Buffer.from(files.get('/host.html').toString().replace("if(m.type==='export'){for", "if(m.type==='export'){window.lastExportIds=m.ids;await new Promise(r=>window.finishExport=r);for")));
   files.set('/sample.pdf',await fixture({transparent:true,predictor:true,cmyk:true}));
   files.set('/duplicates.pdf',await duplicateFixture());
   files.set('/signed.pdf',await signedFixture());
   files.set('/frame-a.pdf',await fixture({pages:1,dimension:256,name:'Frame A'}));
   files.set('/frame-b.pdf',await fixture({pages:1,dimension:256,name:'Frame B'}));
-  files.set('/stack-ab.pdf',await mergeFrames([files.get('/frame-a.pdf'),files.get('/frame-b.pdf')]));
-  files.set('/stack-ba.pdf',await mergeFrames([files.get('/frame-b.pdf'),files.get('/frame-a.pdf')]));
+  files.set('/pages-ab.pdf',await mergeFrames([files.get('/frame-a.pdf'),files.get('/frame-b.pdf')]));
+  files.set('/pages-ba.pdf',await mergeFrames([files.get('/frame-b.pdf'),files.get('/frame-a.pdf')]));
   server=createServer(async(req,res)=>{
     if(req.url.startsWith('/save/')&&req.method==='POST') { const chunks=[];for await(const c of req)chunks.push(c);const name=req.url.slice(6);if(!/^[a-z0-9-]+\.pdf$/.test(name)){res.writeHead(400);res.end();return;} await writeFile('work/qa/'+name,Buffer.concat(chunks));res.end('ok');return; }
     if(req.url==='/'){res.setHeader('Content-Type','text/html');res.end('<script src="/engine.js"></script>');return;}
@@ -191,26 +192,26 @@ test('signed, malformed and invalid-option inputs fail with useful errors',async
   });assert.match(results[0],/signed/i);assert.match(results[1],/read this PDF/i);assert.match(results[2],/resolution/i);assert.match(results[3],/quality/i);assert.match(results[4],/Target/);assert.match(results[5],/200 MiB/);
 });
 
-test('frames stack on one PDF page in the requested order with text, vectors and links intact',async()=>{
+test('frames become separate native PDF pages in manual order with text, vectors and links intact',async()=>{
   await page.evaluate(async()=>{const a=new Uint8Array(await(await fetch('/frame-a.pdf')).arrayBuffer()),b=new Uint8Array(await(await fetch('/frame-b.pdf')).arrayBuffer());const merged=await Crisp.mergeFrames([b,a]);await fetch('/save/merged.pdf',{method:'POST',body:merged});});
-  const doc=await PDFDocument.load(await readFile('work/qa/merged.pdf')),combined=doc.getPage(0);assert.equal(doc.getPageCount(),1);assert.deepEqual(combined.getSize(),{width:900,height:1400});
-  const objects=combined.node.Resources().lookup(PDFName.of('XObject'));
-  const forms=objects.entries().map(([,ref])=>doc.context.lookup(ref));assert.equal(forms.length,2);
+  const doc=await PDFDocument.load(await readFile('work/qa/merged.pdf'));assert.equal(doc.getPageCount(),2);
   for(const [i,name] of ['Frame B','Frame A'].entries()) {
-    assert.equal(forms[i].dict.lookup(PDFName.of('Subtype')).toString(),'/Form');
-    const text=Buffer.from(decodePDFRawStream(forms[i]).decode()).toString('latin1');assert.ok(text.includes(Buffer.from(name+' / page 1').toString('hex').toUpperCase()));assert.match(text,/\bl\b/,'Vector paths must remain drawing instructions');
+    const p=doc.getPage(i);assert.deepEqual(p.getSize(),{width:900,height:700});
+    const text=p.node.Contents().asArray().map(ref=>Buffer.from(decodePDFRawStream(doc.context.lookup(ref)).decode()).toString('latin1')).join('\n');
+    assert.ok(text.includes(Buffer.from(name+' / page 1').toString('hex').toUpperCase()));assert.match(text,/\bl\b/);
+    const links=p.node.Annots().asArray().map(ref=>doc.context.lookup(ref));assert.equal(links.length,1);
+    assert.deepEqual(links[0].lookup(PDFName.of('Rect')).asArray().map(n=>n.asNumber()),[54,155,210,177]);
+    assert.equal(links[0].lookup(PDFName.of('A')).lookup(PDFName.of('URI')).decodeText(),'https://example.com');
   }
-  const links=combined.node.Annots().asArray().map(ref=>doc.context.lookup(ref));assert.equal(links.length,2);
-  assert.deepEqual(links.map(link=>link.lookup(PDFName.of('Rect')).asArray().map(n=>n.asNumber())),[[54,855,210,877],[54,155,210,177]]);
-  assert.ok(links.every(link=>link.lookup(PDFName.of('A')).lookup(PDFName.of('URI')).decodeText()==='https://example.com'));
 });
 
-test('tall stacks retain physical dimensions and empty frames; cropped rotated frames fit',async()=>{
-  const tall=await PDFDocument.create();tall.addPage([600,9000]);const bytes=await tall.save();
-  const combined=await PDFDocument.load(await mergeFrames([bytes,bytes,bytes])),p=combined.getPage(0),unit=p.node.lookup(PDFName.of('UserUnit')).asNumber();
-  assert.equal(combined.getPageCount(),1);assert.ok(p.getHeight()<=14400);assert.equal(p.getWidth()*unit,600);assert.equal(p.getHeight()*unit,27000);
+test('separate pages retain tall and empty frames, native crop boxes, rotation and UserUnit',async()=>{
+  const tall=await PDFDocument.create();tall.addPage([600,120000]);const bytes=await tall.save();
+  const combined=await PDFDocument.load(await mergeFrames([bytes,bytes,bytes]));assert.equal(combined.getPageCount(),3);
+  assert.deepEqual(combined.getPages().map(p=>p.getSize()),Array(3).fill({width:600,height:120000}));
   const rotated=await PDFDocument.create(),source=rotated.addPage([600,900]),font=await rotated.embedFont(StandardFonts.Helvetica);source.drawText('Rotated vector text',{x:70,y:100,size:18,font});source.setCropBox(50,80,300,500);source.setRotation(degrees(90));source.node.set(PDFName.of('UserUnit'),PDFNumber.of(2));
-  const result=await mergeFrames([await rotated.save(),bytes]);await writeFile('work/qa/rotated-stack.pdf',result);const doc=await PDFDocument.load(result);assert.equal(doc.getPageCount(),1);assert.deepEqual(doc.getPage(0).getSize(),{width:1000,height:9600});
+  const result=await mergeFrames([await rotated.save(),bytes]);await writeFile('work/qa/rotated-pages.pdf',result);const doc=await PDFDocument.load(result);
+  assert.equal(doc.getPageCount(),2);assert.deepEqual(doc.getPage(0).getMediaBox(),source.getMediaBox());assert.deepEqual(doc.getPage(0).getCropBox(),source.getCropBox());assert.equal(doc.getPage(0).getRotation().angle,90);assert.equal(doc.getPage(0).node.lookup(PDFName.of('UserUnit')).asNumber(),2);assert.deepEqual(doc.getPage(1).getSize(),{width:600,height:120000});
 });
 
 test('100 MB image-heavy PDF benchmark',async()=>{
@@ -233,7 +234,7 @@ test('Figma frame export, worker compression, download, cancellation and themes'
   await ui.screenshot({path:'work/qa/ui-dark.png',fullPage:true});assert.deepEqual(errors,[]);assert.deepEqual(externalRequests,[]);await ui.close();
 });
 
-test('frame panel drags names, retains manual order on automatic selection updates and exports one page',async()=>{
+test('frame panel drags names, retains manual order on automatic selection updates and exports one page per frame',async()=>{
   const ui=await browser.newPage({viewport:{width:440,height:740},acceptDownloads:true});await ui.goto(url+'/host.html');const panel=ui.frame({name:'plugin'});
   await panel.locator('.frame').first().waitFor();assert.equal(await panel.locator('.frame button').first().isDisabled(),true);
   const lastBox=await panel.locator('.frame').last().boundingBox();await panel.locator('.frame').first().dragTo(panel.locator('.frame').last(),{targetPosition:{x:35,y:lastBox.height-4}});assert.match(await panel.locator('.frame-name').first().textContent(),/Frame B/);
@@ -241,9 +242,10 @@ test('frame panel drags names, retains manual order on automatic selection updat
   await panel.getByRole('button',{name:'Move frame up: Frame A'}).click();assert.match(await panel.locator('.frame-name').first().textContent(),/Frame A/);
   await panel.getByRole('button',{name:'Move frame down: Frame A'}).click();assert.match(await panel.locator('.frame-name').first().textContent(),/Frame B/);
   await ui.screenshot({path:'work/qa/ui-frames.png'});await panel.locator('#run').click();await panel.locator('#result-section').waitFor({state:'visible'});
-  assert.match(await panel.locator('#details').textContent(),/1 page/);const promise=ui.waitForEvent('download');await panel.locator('#download').click();await(await promise).saveAs('work/qa/frames-download.pdf');
-  const downloaded=await readFile('work/qa/frames-download.pdf');assert.ok(downloaded.length<=files.get('/stack-ba.pdf').length,'The delivered PDF must not exceed its native export baseline');
-  const doc=await PDFDocument.load(downloaded);assert.equal(doc.getPageCount(),1);assert.deepEqual(doc.getPage(0).getSize(),{width:900,height:1400});await ui.close();
+  assert.match(await panel.locator('#details').textContent(),/2 pages/);const promise=ui.waitForEvent('download');await panel.locator('#download').click();await(await promise).saveAs('work/qa/frames-download.pdf');
+  const downloaded=await readFile('work/qa/frames-download.pdf');assert.ok(downloaded.length<=files.get('/pages-ba.pdf').length,'The delivered PDF must not exceed its native export baseline');
+  const doc=await PDFDocument.load(downloaded);assert.equal(doc.getPageCount(),2);assert.deepEqual(doc.getPages().map(p=>p.getSize()),[{width:900,height:700},{width:900,height:700}]);
+  const first=doc.getPage(0).node.Contents().asArray().map(ref=>Buffer.from(decodePDFRawStream(doc.context.lookup(ref)).decode()).toString('latin1')).join('\n');assert.ok(first.includes(Buffer.from('Frame B / page 1').toString('hex').toUpperCase()));await ui.close();
 });
 
 test('selection names arrive through a nested Figma bridge and null-source messages',async()=>{
@@ -260,7 +262,7 @@ test('new selected frames appear during an active export and join the next expor
   await panel.getByRole('button',{name:'Move frame up: Frame B'}).click();await panel.locator('#run').click();await ui.waitForFunction(()=>typeof window.finishExport==='function');
   await panel.evaluate(()=>window.dispatchEvent(new MessageEvent('message',{source:null,data:{pluginMessage:{type:'selection',frames:[{id:'1:1',name:'Frame A'},{id:'1:2',name:'Frame B'},{id:'1:3',name:'Newly selected frame'}],ignored:0}}})));
   assert.deepEqual(await panel.locator('.frame-name').allTextContents(),['1. Frame B','2. Frame A','3. Newly selected frame']);assert.equal(await panel.locator('#frame-count').textContent(),'3');assert.equal(await panel.locator('#refresh').count(),0);assert.equal(await panel.locator('#cancel').isVisible(),true);assert.match(await panel.locator('#status').textContent(),/Exporting/);
-  assert.deepEqual(await ui.evaluate(()=>window.lastExportIds),['1:2','1:1']);await ui.evaluate(()=>window.finishExport());await panel.locator('#result-section').waitFor({state:'visible'});assert.match(await panel.locator('#details').textContent(),/2 frames stacked · 1 page/);assert.equal(await panel.locator('#frame-count').textContent(),'3');
+  assert.deepEqual(await ui.evaluate(()=>window.lastExportIds),['1:2','1:1']);await ui.evaluate(()=>window.finishExport());await panel.locator('#result-section').waitFor({state:'visible'});assert.match(await panel.locator('#details').textContent(),/2 frames exported · 2 pages/);assert.equal(await panel.locator('#frame-count').textContent(),'3');
   await panel.locator('#run').click();await ui.waitForFunction(()=>window.lastExportIds.length===3);assert.deepEqual(await ui.evaluate(()=>window.lastExportIds),['1:2','1:1','1:3']);await panel.locator('#cancel').click();await ui.close();
 });
 
@@ -288,7 +290,7 @@ test('an error queued by a cancelled worker cannot terminate the next compressio
   await panel.locator('#cancel').click();await panel.locator('#run').click();await panel.waitForFunction(()=>window.testWorkers[1]?.request);
   await panel.evaluate(()=>window.testWorkers[0].savedError());
   assert.equal(await panel.evaluate(()=>!!window.testWorkers[1].terminated),false,'A stale callback must not stop the new worker');
-  await panel.evaluate(()=>{const w=window.testWorkers[1],r=w.request;w.onmessage({data:{id:r.id,result:{bytes:r.bytes,pages:1,originalBytes:r.bytes.length,outputBytes:r.bytes.length,savedPercent:0,originalRetained:true,optimized:0,duplicates:0,skipped:0}}});});
+  await panel.evaluate(()=>{const w=window.testWorkers[1],r=w.request;w.onmessage({data:{id:r.id,result:{bytes:r.parts[0],pages:r.parts.length,originalBytes:r.parts[0].length,outputBytes:r.parts[0].length,savedPercent:0,originalRetained:true,optimized:0,duplicates:0,skipped:0}}});});
   await panel.locator('#result-section').waitFor({state:'visible'});await ui.close();
 });
 
@@ -320,54 +322,41 @@ test('a Figma plugin ID enables relaunch registration and persistent preferences
   await onmessage({type:'preferences',preferences:{preset:'balanced',filename:'x'.repeat(120)}});assert.equal(writes.length,1);assert.equal(writes[0].key,'crisp-pdf-v1');assert.equal(writes[0].value.preset,'balanced');assert.equal(writes[0].value.filename.length,100);
 });
 
-function nativeStackMock({fail=false,hold=false}={}) {
-  const posted=[],calls=[],pageNode={type:'PAGE',children:[],selection:[]};let onmessage,release,sequence=0;
+function nativeExportMock({fail=false,hold=false}={}) {
+  const posted=[],calls=[],pageNode={type:'PAGE',children:[],selection:[]};let onmessage,release;
   function frame(id,width=600,height=700,x=0,y=0) {
-    const node={id,name:id,type:'FRAME',width,height,x,y,parent:pageNode,removed:false,children:[],absoluteBoundingBox:{x,y,width,height},absoluteTransform:[[1,0,x],[0,1,y]],resolvedVariableModes:{collection:'mode'},
-      findAllWithCriteria(){return [];},
-      resizeWithoutConstraints(w,h){this.width=w;this.height=h;},
-      appendChild(child){if(child.parent?.children){const i=child.parent.children.indexOf(child);if(i>=0)child.parent.children.splice(i,1);}child.parent=this;this.children.push(child);},
-      clone(){const copy=frame('copy:'+id,width,height,x,y);copy.sourceId=id;copy.resolvedVariableModes={};return copy;},
-      setExplicitVariableModeForCollection(collection,mode){assert.equal(typeof collection,'object','Incremental mode requires the collection node');this.explicitModes??={};this.explicitModes[collection.id]=mode;},
-      remove(){for(const child of [...this.children])child.remove();const i=this.parent?.children?.indexOf(this);if(i>=0)this.parent.children.splice(i,1);this.removed=true;},
-      async exportAsync(settings){calls.push({id:this.id,width:this.width,height:this.height,settings,frames:this.children.map(v=>({x:v.x,y:v.y,width:v.width,height:v.height,source:v.children[0].sourceId,transform:v.children[0].relativeTransform,modes:v.children[0].explicitModes}))});if(hold)await new Promise(r=>release=r);if(fail)throw new Error('Native export failed');return new Uint8Array([1,2,3]);}
+    const node={id,name:id,type:'FRAME',width,height,x,y,parent:pageNode,removed:false,
+      clone(){throw new Error('Native page export must not clone original artwork');},
+      async exportAsync(settings){calls.push({id:this.id,width:this.width,height:this.height,settings});if(hold)await new Promise(r=>release=r);if(fail)throw new Error('Native export failed');return new Uint8Array([1,2,3]);}
     };pageNode.children.push(node);return node;
   }
   const a=frame('a',600,700,120,80),b=frame('b',375,900,1000,40);pageNode.selection=[a,b];
-  const figma={currentPage:pageNode,root:{},showUI(){},on(){},createFrame:()=>frame('temporary:'+ ++sequence),variables:{getVariableCollectionByIdAsync:async id=>({id})},getNodeByIdAsync:async id=>[a,b].find(n=>n.id===id),ui:{postMessage(msg){posted.push(msg);if(msg.type==='frame-pdf')queueMicrotask(()=>onmessage({type:'ack',requestId:msg.requestId,index:msg.index}));},set onmessage(fn){onmessage=fn;}}};
+  const figma={currentPage:pageNode,root:{},showUI(){},on(){},createFrame(){throw new Error('No temporary artwork should be created');},getNodeByIdAsync:async id=>[a,b].find(n=>n.id===id),ui:{postMessage(msg){posted.push(msg);if(msg.type==='frame-pdf')queueMicrotask(()=>onmessage({type:'ack',requestId:msg.requestId,index:msg.index}));},set onmessage(fn){onmessage=fn;}}};
   return{figma,posted,calls,pageNode,a,b,message:m=>onmessage(m),release:()=>{const resolve=release;release=undefined;resolve?.();},waiting:()=>!!release};
 }
 
-test('a frame stack is exported once in native Figma with manual order and original nodes intact',async()=>{
-  const mock=nativeStackMock();vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
-  await mock.message({type:'export',ids:['b','a'],requestId:3});assert.equal(mock.calls.length,1);
-  const native=mock.calls[0];assert.equal(native.settings.format,'PDF');assert.equal(native.width,600);assert.equal(native.height,1600);
-  assert.deepEqual(native.frames.map(f=>f.source),['b','a']);assert.deepEqual(native.frames.map(f=>f.y),[0,900]);assert.deepEqual(native.frames.map(f=>f.x),[0,0]);assert.deepEqual(native.frames.map(f=>f.modes.collection),['mode','mode']);
-  assert.deepEqual(JSON.parse(JSON.stringify(native.frames.map(f=>f.transform))),[[[1,0,0],[0,1,0]],[[1,0,0],[0,1,0]]]);
+test('each frame is exported natively in manual order without modifying the original artwork',async()=>{
+  const mock=nativeExportMock();vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  await mock.message({type:'export',ids:['b','a'],requestId:3});
+  assert.deepEqual(mock.calls.map(c=>c.id),['b','a']);assert.deepEqual(mock.calls.map(c=>[c.width,c.height]),[[375,900],[600,700]]);
+  assert.ok(mock.calls.every(c=>c.settings.format==='PDF'&&c.settings.useAbsoluteBounds));
   assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);assert.equal(mock.a.x,120);assert.equal(mock.b.x,1000);assert.deepEqual(mock.pageNode.selection,[mock.a,mock.b]);
-  assert.equal(mock.posted.filter(m=>m.type==='frame-pdf').length,1);assert.equal(mock.posted.at(-1).type,'export-complete');
+  const transfers=mock.posted.filter(m=>m.type==='frame-pdf');assert.deepEqual(transfers.map(m=>[m.index,m.count]),[[0,2],[1,2]]);assert.equal(mock.posted.at(-1).type,'export-complete');
 });
 
-test('single long frames and stacks beyond 100,000 px reach native PDF export at full size',async()=>{
+test('individual frames beyond 100,000 px reach native PDF export at their full dimensions',async()=>{
   for(const ids of [['a'],['b','a']]){
-    const mock=nativeStackMock();
-    Object.assign(mock.a,{height:120000,absoluteBoundingBox:{x:120,y:80,width:600,height:120000}});
-    Object.assign(mock.b,{height:90000,absoluteBoundingBox:{x:1000,y:40,width:375,height:90000}});
+    const mock=nativeExportMock();mock.a.height=120000;mock.b.height=90000;
     vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
     await mock.message({type:'export',ids,requestId:7});
-    assert.equal(mock.calls.length,1,'Export the whole native document once, preserving shared resources');
-    assert.equal(mock.calls[0].height,ids.length===1?120000:210000);
-    assert.equal(mock.calls[0].width,600);
-    if(ids.length>1){assert.deepEqual(mock.calls[0].frames.map(f=>f.source),['b','a']);assert.deepEqual(mock.calls[0].frames.map(f=>f.y),[0,90000]);}
-    assert.equal(mock.posted.at(-1).type,'export-complete');
-    assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);assert.deepEqual(mock.pageNode.selection,[mock.a,mock.b]);
-    assert.equal(mock.a.height,120000);assert.equal(mock.b.height,90000);
+    assert.deepEqual(mock.calls.map(c=>c.id),ids);assert.deepEqual(mock.calls.map(c=>c.height),ids.map(id=>id==='a'?120000:90000));
+    assert.equal(mock.posted.at(-1).type,'export-complete');assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);assert.deepEqual(mock.pageNode.selection,[mock.a,mock.b]);
   }
 });
 
-test('native export errors and cancellation always remove temporary copies',async()=>{
+test('native export errors and cancellation never alter original artwork',async()=>{
   for(const options of [{fail:true},{hold:true}]){
-    const mock=nativeStackMock(options);vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+    const mock=nativeExportMock(options);vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
     const job=mock.message({type:'export',ids:['a','b'],requestId:4});
     if(options.hold){while(!mock.waiting())await new Promise(r=>setImmediate(r));await mock.message({type:'cancel'});mock.release();}
     await job;assert.equal(mock.posted.at(-1).type,'export-error');assert.match(mock.posted.at(-1).message,options.hold?/Cancelled/:/Native export failed/);
@@ -376,7 +365,7 @@ test('native export errors and cancellation always remove temporary copies',asyn
 });
 
 test('a new export requested immediately after cancellation waits and completes instead of being lost',async()=>{
-  const mock=nativeStackMock({hold:true});vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  const mock=nativeExportMock({hold:true});vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
   const first=mock.message({type:'export',ids:['a','b'],requestId:10});while(!mock.waiting())await new Promise(r=>setImmediate(r));
   await mock.message({type:'cancel',requestId:10});await mock.message({type:'export',ids:['b'],requestId:11});assert.equal(mock.calls.length,1);mock.release();await first;
   for(let i=0;i<100&&mock.calls.length<2;i++)await new Promise(r=>setTimeout(r,5));
@@ -385,9 +374,9 @@ test('a new export requested immediately after cancellation waits and completes 
   assert.ok(mock.posted.some(m=>m.type==='export-complete'&&m.requestId===11));assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
 });
 
-test('cancelling a queued replacement and closing the plugin never leave temporary artwork or run queued exports',async()=>{
+test('cancelling a queued replacement and closing the plugin never run further page exports',async()=>{
   for(const close of [false,true]){
-    const mock=nativeStackMock({hold:true}),events=new Map();mock.figma.on=(name,handler)=>events.set(name,handler);
+    const mock=nativeExportMock({hold:true}),events=new Map();mock.figma.on=(name,handler)=>events.set(name,handler);
     vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
     const first=mock.message({type:'export',ids:['a','b'],requestId:20});while(!mock.waiting())await new Promise(r=>setImmediate(r));
     await mock.message({type:'cancel',requestId:20});await mock.message({type:'export',ids:['b'],requestId:21});
@@ -399,14 +388,14 @@ test('cancelling a queued replacement and closing the plugin never leave tempora
 });
 
 test('cancellation during asynchronous node lookup does not start native rendering',async()=>{
-  const mock=nativeStackMock();let resolveLookup;mock.figma.getNodeByIdAsync=()=>new Promise(r=>resolveLookup=r);
+  const mock=nativeExportMock();let resolveLookup;mock.figma.getNodeByIdAsync=()=>new Promise(r=>resolveLookup=r);
   vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
   const job=mock.message({type:'export',ids:['a'],requestId:30});await mock.message({type:'cancel',requestId:30});resolveLookup(mock.a);await job;
   assert.equal(mock.calls.length,0);assert.equal(mock.posted.at(-1).type,'export-error');assert.match(mock.posted.at(-1).message,/Cancelled/);
 });
 
 test('a failed PDF transfer clears its acknowledgement timer and permits a later export',async()=>{
-  const mock=nativeStackMock(),timers=new Set();let failed=false;const post=mock.figma.ui.postMessage;
+  const mock=nativeExportMock(),timers=new Set();let failed=false;const post=mock.figma.ui.postMessage;
   mock.figma.ui.postMessage=message=>{if(message.type==='frame-pdf'&&!failed){failed=true;throw new Error('Transfer failed');}post(message);};
   vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout:(fn,delay)=>{const timer=setTimeout(fn,delay);timers.add(timer);return timer;},clearTimeout:timer=>{timers.delete(timer);clearTimeout(timer);},console});
   await mock.message({type:'export',ids:['a'],requestId:40});assert.equal(timers.size,0);assert.match(mock.posted.at(-1).message,/Transfer failed/);
@@ -479,34 +468,14 @@ test('a failed form scan preserves its images but still downsamples unrelated ph
   assert.deepEqual(dimensions,[48,1024]);
 });
 
-test('components and instances appear in selection and export like frames after their fonts load',async()=>{
-  const mock=nativeStackMock(),loaded=[];mock.a.type='COMPONENT';mock.b.type='INSTANCE';
-  const regular={family:'Apis',style:'Regular'},bold={family:'Apis',style:'Bold'};
-  mock.figma.mixed=Symbol('mixed');
-  mock.a.findAllWithCriteria=()=>[{fontName:regular}];
-  mock.b.findAllWithCriteria=()=>[{fontName:mock.figma.mixed,getStyledTextSegments:()=>[{fontName:regular},{fontName:bold}]}];
-  mock.figma.loadFontAsync=async font=>{await new Promise(r=>setTimeout(r,2));loaded.push(font);};
-  const clone=mock.a.clone;mock.a.clone=()=>{assert.equal(loaded.length,2,'Load mixed and regular fonts before creating temporary copies');return clone();};
+test('components and instances export as standalone native pages without cloning or font mutations',async()=>{
+  const mock=nativeExportMock();mock.a.type='COMPONENT';mock.b.type='INSTANCE';
+  mock.figma.loadFontAsync=()=>{throw new Error('Native export must not require text mutations');};
   vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
   assert.deepEqual(Array.from(mock.posted.find(m=>m.type==='selection').frames,f=>f.name),['a','b']);
-  await mock.message({type:'export',ids:['a','b'],requestId:18});
-  assert.equal(mock.calls.length,1);assert.deepEqual(loaded,[regular,bold]);assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
+  await mock.message({type:'export',ids:['b','a'],requestId:18});
+  assert.deepEqual(mock.calls.map(c=>c.id),['b','a']);assert.equal(mock.posted.filter(m=>m.type==='frame-pdf').length,2);assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
 });
-
-test('unavailable fonts and cancellation during font loading never create temporary artwork',async()=>{
-  for(const cancel of [false,true]){
-    const mock=nativeStackMock();let release;
-    mock.a.findAllWithCriteria=()=>[{fontName:{family:'Apis',style:'Bold'}}];
-    mock.figma.loadFontAsync=cancel?()=>new Promise(r=>release=r):async()=>{throw new Error('Unavailable');};
-    vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
-    const pending=mock.message({type:'export',ids:['a','b'],requestId:19});
-    if(cancel){while(!release)await new Promise(r=>setTimeout(r,1));await mock.message({type:'cancel',requestId:19});release();}
-    await pending;
-    assert.equal(mock.calls.length,0);assert.deepEqual(mock.pageNode.children,[mock.a,mock.b]);
-    assert.match(mock.posted.at(-1).message,cancel?/Cancelled/:/Apis Bold.*Install that font/);
-  }
-});
-
 
 test('cached form reuse has a finite traversal budget and preserves uncertain image resolution',async()=>{
   const doc=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=doc.getPage(0),n=PDFName.of;
@@ -518,4 +487,35 @@ test('cached form reuse has a finite traversal budget and preserves uncertain im
   const output=await PDFDocument.load(await readFile('work/qa/repeated-forms.pdf'));
   const image=output.context.enumerateIndirectObjects().map(([,o])=>o).find(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image');
   assert.equal(image.dict.lookup(n('Width')).asNumber(),1024);
+});
+
+
+test('a missing or out-of-order native page cannot produce a partial PDF download',async()=>{
+  const ui=await browser.newPage();await ui.goto(url+'/live-host.html');const panel=ui.frame({name:'plugin'});await panel.locator('.frame').first().waitFor();
+  for(const missing of [true,false]){
+    await panel.locator('#run').click();await ui.waitForFunction(()=>typeof window.finishExport==='function');
+    await ui.evaluate(async missing=>{const bytes=new Uint8Array(await(await fetch('/frame-a.pdf')).arrayBuffer());const send=m=>document.getElementById('plugin').contentWindow.postMessage({pluginMessage:m},'*');
+      const requestId=missing?1:2;send({type:'frame-pdf',requestId,index:missing?0:1,count:2,bytes});if(missing)send({type:'export-complete',requestId});},missing);
+    await panel.locator('#status.error').waitFor();assert.match(await panel.locator('#status').textContent(),missing?/page is missing/:/out of order/);assert.equal(await panel.locator('#result-section').isVisible(),false);assert.equal(await panel.locator('#run').isDisabled(),false);
+  }
+  await ui.close();
+});
+
+test('native page transfers wait for the correct acknowledgement and cancellation discards an unfinished batch',async()=>{
+  const mock=nativeExportMock();mock.figma.ui.postMessage=m=>mock.posted.push(m);
+  vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  const pending=mock.message({type:'export',ids:['b','a'],requestId:60});
+  while(!mock.posted.some(m=>m.type==='frame-pdf'))await new Promise(r=>setImmediate(r));
+  await mock.message({type:'ack',requestId:60,index:1});await new Promise(r=>setImmediate(r));assert.equal(mock.calls.length,1);
+  await mock.message({type:'ack',requestId:60,index:0});while(mock.posted.filter(m=>m.type==='frame-pdf').length<2)await new Promise(r=>setImmediate(r));
+  await mock.message({type:'cancel',requestId:60});await pending;assert.deepEqual(mock.calls.map(c=>c.id),['b','a']);assert.equal(mock.posted.at(-1).type,'export-error');assert.match(mock.posted.at(-1).message,/Cancelled/);assert.ok(!mock.posted.some(m=>m.type==='export-complete'));
+});
+
+test('compression shares photos across standalone pages and respects their largest placement',async()=>{
+  const native=await PDFDocument.load(await fixture({pages:1,dimension:1024})),p=native.getPage(0),n=PDFName.of;
+  p.node.set(n('Contents'),native.context.register(native.context.flateStream('q 24 0 0 24 0 0 cm /Photo Do Q')));const small=await native.save();
+  p.node.set(n('Contents'),native.context.register(native.context.flateStream('q 300 0 0 300 0 0 cm /Photo Do Q')));const large=await native.save();files.set('/small-placement.pdf',small);files.set('/large-placement.pdf',large);
+  await page.evaluate(async()=>{const parts=await Promise.all(['/small-placement.pdf','/large-placement.pdf'].map(async path=>new Uint8Array(await(await fetch(path)).arrayBuffer())));const r=await Crisp.compressFrames(parts,{preset:'balanced'});await fetch('/save/shared-pages.pdf',{method:'POST',body:r.bytes});});
+  const out=await PDFDocument.load(await readFile('work/qa/shared-pages.pdf'));assert.equal(out.getPageCount(),2);
+  const images=out.context.enumerateIndirectObjects().map(([,o])=>o).filter(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image');assert.equal(images.length,1);assert.equal(images[0].dict.lookup(n('Width')).asNumber(),600);
 });

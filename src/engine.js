@@ -1,4 +1,4 @@
-import { PDFDocument, PDFName, PDFNumber, PDFDict, PDFArray, PDFRef, PDFRawStream, decodePDFRawStream, degrees } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFNumber, PDFDict, PDFArray, PDFRef, PDFRawStream, decodePDFRawStream } from 'pdf-lib';
 import pako from 'pako';
 
 export const LIMITS = { bytes: 200 * 1024 * 1024, pages: 300, pixels: 40_000_000, objects: 200_000 };
@@ -492,52 +492,36 @@ export async function compressPdf(bytes, options = {}, progress = () => {}, sign
   progress({ phase: 'Ready to download', value: 1 });
   return { ...best, originalBytes: bytes.length, outputBytes: best.bytes.length, savedPercent: Math.max(0, 100 * (1 - best.bytes.length / bytes.length)), targetMet: !target || best.bytes.length <= target };
 }
-export async function mergeFrames(parts) {
+export async function mergeFrames(parts, progress = () => {}, signal) {
   if (!parts.length || parts.length > LIMITS.pages) throw new Error('Choose 1–300 frames.');
-  const out = await PDFDocument.create(), frames = []; let total = 0, width = 0, height = 0;
+  let total = 0;
   for (const part of parts) {
-    total += part.length; if (total > LIMITS.bytes) throw new Error('Frame exports exceed the 200 MiB local processing limit. Export fewer frames.');
-    const doc = await loadPdf(part);
-    if (doc.getPageCount() !== 1) throw new Error('A frame export must contain exactly one page.');
-    const [source] = await out.copyPages(doc, [0]), box = source.getCropBox(), unit = num(source.node, 'UserUnit', 1);
-    const rotation = ((source.getRotation().angle % 360) + 360) % 360;
-    if (![0,90,180,270].includes(rotation) || ![box.x,box.y,box.width,box.height,unit].every(Number.isFinite) || box.width<=0 || box.height<=0 || unit<=0) throw new Error('A frame export has invalid page dimensions.');
-    const w = box.width * unit, h = box.height * unit, frameWidth = rotation%180 ? h:w, frameHeight = rotation%180 ? w:h;
-    // An empty frame still needs a content stream for PDF page embedding.
-    if (!source.node.Contents()) source.pushOperators();
-    const embedded = await out.embedPage(source, {left:box.x,bottom:box.y,right:box.x+box.width,top:box.y+box.height});
-    frames.push({source,embedded,box,unit,rotation,w,h,width:frameWidth,height:frameHeight});
-    width = Math.max(width, frameWidth); height += frameHeight;
+    if (!(part instanceof Uint8Array)) throw new Error('Invalid frame export.');
+    total += part.length;
+    if (total > LIMITS.bytes) throw new Error('Frame exports exceed the 200 MiB local processing limit. Export fewer frames.');
   }
-  // Keep tall stacks within PDF's 14,400-unit page box without changing their physical size.
-  const pageUnit = Math.max(1, Math.max(width,height)/14400);
-  if (!Number.isFinite(pageUnit) || pageUnit>75000) throw new Error('The combined page is too large. Export fewer frames.');
-  const page = out.addPage([width/pageUnit,height/pageUnit]);
-  if (pageUnit>1) page.node.set(N('UserUnit'), PDFNumber.of(pageUnit));
-  let top = height;
-  for (const f of frames) {
-    const bottom = top-f.height, x = f.rotation===180 ? f.w : f.rotation===270 ? f.h : 0;
-    const y = bottom + (f.rotation===90 ? f.w : f.rotation===180 ? f.h : 0);
-    page.drawPage(f.embedded, {x:x/pageUnit,y:y/pageUnit,xScale:f.unit/pageUnit,yScale:f.unit/pageUnit,rotate:degrees(-f.rotation)});
-    // Preserve clickable URI links while translating their hit areas into the combined page.
-    const point = (x,y) => {
-      x=(x-f.box.x)*f.unit; y=(y-f.box.y)*f.unit;
-      const rotated = f.rotation===90 ? [y,f.w-x] : f.rotation===180 ? [f.w-x,f.h-y] : f.rotation===270 ? [f.h-y,x] : [x,y];
-      return [rotated[0]/pageUnit,(rotated[1]+bottom)/pageUnit];
-    };
-    const annotations = f.source.node.Annots();
-    if (annotations instanceof PDFArray) for (const ref of annotations.asArray()) {
-      const original = out.context.lookup(ref), action = original instanceof PDFDict ? original.lookup(N('A')) : null;
-      if (!(original instanceof PDFDict) || named(original,'Subtype')!=='Link' || !(action instanceof PDFDict) || named(action,'S')!=='URI') continue;
-      const rect=original.lookup(N('Rect')); if (!(rect instanceof PDFArray) || rect.size()!==4) continue;
-      const values=rect.asArray().map(v=>out.context.lookup(v)).map(v=>v instanceof PDFNumber?v.asNumber():NaN); if (!values.every(Number.isFinite)) continue;
-      const corners=[point(values[0],values[1]),point(values[2],values[3]),point(values[0],values[3]),point(values[2],values[1])];
-      const link=original.clone(out.context); link.set(N('P'),page.ref); link.delete(N('QuadPoints'));
-      link.set(N('Rect'),out.context.obj([Math.min(...corners.map(p=>p[0])),Math.min(...corners.map(p=>p[1])),Math.max(...corners.map(p=>p[0])),Math.max(...corners.map(p=>p[1]))]));
-      page.node.addAnnot(out.context.register(link));
-    }
-    top = bottom;
+  const out = await PDFDocument.create();
+  for (let i = 0; i < parts.length; i++) {
+    check(signal); progress({ phase: `Combining page ${i + 1} of ${parts.length}`, value: 0.01 });
+    const doc = await loadPdf(parts[i]); check(signal);
+    if (doc.getPageCount() !== 1) throw new Error('A frame export must contain exactly one page.');
+    const source = doc.getPage(0), box = source.getMediaBox(), crop = source.getCropBox(), unit = num(source.node,'UserUnit',1);
+    if (![box.x,box.y,box.width,box.height,crop.x,crop.y,crop.width,crop.height,unit,source.getRotation().angle].every(Number.isFinite) || box.width<=0 || box.height<=0 || crop.width<=0 || crop.height<=0 || unit<=0) throw new Error('A frame export has invalid page dimensions.');
+    const [page] = await out.copyPages(doc,[0]); check(signal);
+    // Copy the complete native page, including its boxes, rotation and links.
+    // Compression later shares duplicate fonts, images and masks across pages.
+    out.addPage(page); await tick();
   }
   out.setProducer('Compress PDF');
-  return out.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false });
+  check(signal);
+  const bytes = await out.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 40 });
+  check(signal); return bytes;
+}
+export async function compressFrames(parts, options = {}, progress = () => {}, signal) {
+  if (!parts.length || parts.length > LIMITS.pages) throw new Error('Choose 1–300 frames.');
+  check(signal);
+  const bytes = parts.length === 1 ? parts[0] : await mergeFrames(parts,progress,signal);
+  const result = await compressPdf(bytes,options,progress,signal);
+  if (result.pages !== parts.length) throw new Error('PDF page validation failed. Export again.');
+  return result;
 }

@@ -1,8 +1,8 @@
-import { compressPdf, PRESETS, LIMITS } from './engine.js';
+import { compressFrames, PRESETS, LIMITS } from './engine.js';
 const $ = id => document.getElementById(id);
 const post = msg => parent.postMessage({ pluginMessage: msg }, '*');
 const size = n => n < 1_000_000 ? `${(n/1000).toFixed(0)} KB` : `${(n/1_000_000).toFixed(n >= 10_000_000 ? 1 : 2)} MB`;
-let frames = [], output = null, busy = false, job = 0, parts = [], worker = null, sequence = 0, abort = null, workerUnavailable = false, exportFrames = [];
+let frames = [], output = null, busy = false, job = 0, parts = [], receivedBytes = 0, worker = null, sequence = 0, abort = null, workerUnavailable = false, exportFrames = [];
 let settingsTouched = false;
 const pending = new Map();
 function stopWorker(error = new Error('Cancelled')) {
@@ -41,7 +41,7 @@ async function call(action, data, progress, current) {
   let w; try { w = getWorker(); } catch { /* Hosts that block blob workers can still process locally. */ }
   if (!w) {
     const controller = new AbortController(); abort = controller;
-    try { return await compressPdf(data.bytes, data.options, progress, controller.signal); }
+    try { return await compressFrames(data.parts, data.options, progress, controller.signal); }
     finally { if (abort === controller) abort = null; }
   }
   try {
@@ -101,13 +101,13 @@ function options() {
   if (p !== 'lossless' && (!Number.isFinite(Number($('quality').value)) || Number($('quality').value) < 40 || Number($('quality').value) > 100)) throw new Error('Image quality must be 40–100%.');
   return { preset: p, ...(p !== 'lossless' ? { dpi:Number($('dpi').value), quality:Number($('quality').value)/100 } : {}) };
 }
-async function compress(bytes, current) {
-  const result = await call('compress', { bytes, options: options() }, p => { if (current !== job) return; $('progress').value = p.value; status(`${p.phase}${p.attempts > 1 ? ` · pass ${p.attempt}` : ''}`); }, current);
+async function compress(pages, current) {
+  const result = await call('compress-frames', { parts: pages, options: options() }, p => { if (current !== job) return; $('progress').value = p.value; status(`${p.phase}${p.attempts > 1 ? ` · pass ${p.attempt}` : ''}`); }, current);
   if (current !== job) return;
   output = result;
   $('sizes').textContent = `${size(result.originalBytes)} → ${size(result.outputBytes)}`;
   $('savings').textContent = result.originalRetained ? 'Already optimized · native export retained' : `${result.savedPercent.toFixed(1)}% smaller`;
-  $('details').textContent = `${exportFrames.length} ${exportFrames.length===1?'frame':'frames'} stacked · ${result.pages} ${result.pages===1?'page':'pages'} · ${result.optimized} images optimized · ${result.duplicates} identical resources reused`;
+  $('details').textContent = `${exportFrames.length} ${exportFrames.length===1?'frame':'frames'} exported · ${result.pages} ${result.pages===1?'page':'pages'} · ${result.optimized} images optimized · ${result.duplicates} identical resources reused`;
   const notes = [];
   if (result.skipped) notes.push(`${result.skipped} images kept at their current encoding, including masks, unsupported color spaces, and images already smaller.`);
   notes.push('Frame text remains sharp vector artwork. Searchability depends on Figma’s export.');
@@ -121,7 +121,7 @@ async function run() {
   try { options(); } catch (e) { status(e.message, true); return; }
   settingsTouched = true; clearResult(); busy = true; const current = ++job; $('progress').value = 0; controls();
   try {
-    parts = []; exportFrames = frames.slice(); post({ type:'export', ids:exportFrames.map(f=>f.id), requestId:current }); status('Exporting frames…');
+    parts = []; receivedBytes = 0; exportFrames = frames.slice(); post({ type:'export', ids:exportFrames.map(f=>f.id), requestId:current }); status('Exporting frames…');
   } catch (e) { if (current !== job) return; busy = false; status(e.message, true); controls(); }
 }
 function filename() { let n = $('filename').value.trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g,'-') || 'compressed.pdf'; if (!/\.pdf$/i.test(n)) n += '.pdf'; return n; }
@@ -147,11 +147,18 @@ window.addEventListener('message', async e => {
   } else if (msg.requestId === job && busy) {
     if (msg.type === 'export-waiting') status('Finishing the cancelled export…');
     if (msg.type === 'export-progress') { status(`Exporting ${msg.index+1} / ${msg.count}: ${msg.name}`); $('progress').value = .3 * msg.index/msg.count; }
-    if (msg.type === 'frame-pdf') { parts.push(new Uint8Array(msg.bytes)); post({type:'ack', requestId:job, index:msg.index}); }
+    if (msg.type === 'frame-pdf') {
+      try {
+        if (msg.index !== parts.length || msg.count !== exportFrames.length) throw new Error('Frame pages arrived out of order. Export again.');
+        const bytes = new Uint8Array(msg.bytes); receivedBytes += bytes.length;
+        if (receivedBytes > LIMITS.bytes) throw new Error('Frame exports exceed 200 MiB. Export fewer frames.');
+        parts.push(bytes); post({type:'ack', requestId:job, index:msg.index});
+      } catch (e) { post({type:'cancel', requestId:job}); busy=false; parts=[]; status(e.message,true); controls(); }
+    }
     if (msg.type === 'export-complete') {
       const current = job;
-      try { if (parts.length !== 1) throw new Error('Expected one native PDF export. Reopen the plugin.'); const bytes = parts[0]; parts=[]; await compress(bytes,current); }
-      catch (e) { if (current !== job) return; busy=false; parts=[]; status(e.message,true); controls(); }
+      try { if (parts.length !== exportFrames.length) throw new Error('A frame page is missing. Export again.'); const pages = parts; parts=[]; await compress(pages,current); }
+      catch (e) { if (current !== job) return; post({type:'cancel',requestId:current}); busy=false; parts=[]; status(e.message,true); controls(); }
     }
     if (msg.type === 'export-error') { busy=false; parts=[]; status(msg.message,true); controls(); }
   }
