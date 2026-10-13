@@ -6,16 +6,13 @@ https://github.com/user-attachments/assets/ad06c311-1dfe-4fe4-932e-f706a923de3a
 
 ## Install
 
-Requires **Figma Desktop** and **Node.js 20.19+**.
+Requires **Figma Desktop**. The repository includes the ready-to-run plugin in `dist/`; Node.js and a build step are not needed to install it.
 
-```sh
-git clone https://github.com/Seyyahil/compress-pdf-figma-plugin.git
-cd compress-pdf-figma-plugin
-npm ci
-npm run build
-```
+1. Download and extract the repository, or clone it from GitHub.
+2. In a Figma Design file, choose **Plugins → Development → Import plugin from manifest**.
+3. Select the root `manifest.json`, then run **Compress PDF**.
 
-In a Figma Design file, choose **Plugins → Development → Import plugin from manifest** and select the root `manifest.json`.
+Keep `manifest.json` and the `dist` folder together. If you move the folder, reimport its manifest from the new location.
 
 ## Use
 
@@ -30,7 +27,15 @@ Run **Compress PDF**, select frames, components, or component instances, set the
 
 ## Development
 
-`npm run verify` runs checks, build, and tests (requires Google Chrome). Rebuild with `npm run build` after code changes.
+Requires **Node.js 20.19+** and Google Chrome for browser tests.
+
+```sh
+npm ci
+npm run verify
+npm run check:distribution
+```
+
+Rebuild with `npm run build` after code changes and commit the updated `dist` files with the source. CI checks the code and tests, confirms the manifest's runtime files are tracked, and rejects bundles that differ from a fresh build.
 
 Tests cover components and instances, page order and dimensions, large vector streams, transform-aware coordinate precision, the Figma message flow, cancellation and retry, worker fallback, PDF drawing commands, transparency masks, image placement, and the output size guard.
 

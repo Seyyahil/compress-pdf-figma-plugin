@@ -1,0 +1,2 @@
+# PDF xref strings in generated JavaScript contain significant trailing spaces.
+dist/ui.html whitespace=-blank-at-eol
