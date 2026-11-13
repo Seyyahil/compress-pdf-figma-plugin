@@ -1,11 +1,22 @@
-import { compressFrames } from './engine.js';
-self.onmessage = async (event) => {
-  const { id, action, parts, options } = event.data;
+import { createFrameExport } from './engine.js';
+let exportJob = null, report = null;
+self.onmessage = async ({ data: { id, action, count, options, bytes } }) => {
   try {
-    if (action === 'compress-frames') {
-      const result = await compressFrames(parts, options, progress => self.postMessage({ id, progress }));
+    report = progress => self.postMessage({ id, progress });
+    if (action === 'start-export') {
+      exportJob = createFrameExport(count, options, progress => report?.(progress));
+    } else if (action === 'add-frame' && exportJob) {
+      await exportJob.add(bytes);
+    } else if (action === 'finish-export' && exportJob) {
+      const job = exportJob; exportJob = null;
+      const result = await job.finish();
       self.postMessage({ id, result }, [result.bytes.buffer]);
+      return;
     } else throw new Error('Unknown PDF operation');
-  } catch (e) { self.postMessage({ id, error: e.message || String(e) }); }
+    self.postMessage({ id, result: null });
+  } catch (error) {
+    exportJob = null;
+    self.postMessage({ id, error: error.message || String(error) });
+  } finally { report = null; }
 };
 self.postMessage({ ready: true });

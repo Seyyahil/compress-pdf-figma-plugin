@@ -318,12 +318,13 @@ async function optimizeImage(doc, ref, s, setting, use) {
 function hasSignature(doc) {
   return doc.context.enumerateIndirectObjects().some(([, o]) => o instanceof PDFDict && o.has(N('ByteRange')));
 }
+class PdfLimitError extends Error {}
 async function loadPdf(bytes) {
-  if (bytes.length > LIMITS.bytes) throw new Error('The frame export exceeds the 200 MiB processing limit. Export fewer frames.');
+  if (bytes.length > LIMITS.bytes) throw new PdfLimitError('A single native PDF exceeds the 200 MiB processing limit.');
   let doc;
   try { doc = await PDFDocument.load(bytes, { updateMetadata: false, throwOnInvalidObject: true }); } catch (e) { if (/encrypt/i.test(String(e))) throw new Error('Could not process a password-protected frame export.'); throw new Error('Could not read this PDF. ' + e.message); }
   if (doc.getPageCount() < 1 || doc.getPageCount() > LIMITS.pages) throw new Error('The frame export has an unsupported page count.');
-  if (doc.context.enumerateIndirectObjects().length > LIMITS.objects) throw new Error('This PDF has too many objects for local processing.');
+  if (doc.context.enumerateIndirectObjects().length > LIMITS.objects) throw new PdfLimitError('This PDF has too many objects for local processing.');
   if (hasSignature(doc)) throw new Error('Could not process a digitally signed frame export.');
   return doc;
 }
@@ -441,7 +442,7 @@ function prune(doc) {
 async function pass(bytes, settings, progress, signal) {
   check(signal); progress({ phase: 'Reading PDF', value: 0.04 });
   const doc = await loadPdf(bytes);
-  const sizes = doc.getPages().map(p => JSON.stringify([p.getMediaBox(), p.getCropBox(), p.getRotation().angle]));
+  const sizes = doc.getPages().map(pageGeometry);
   progress({ phase: 'Sharing repeated images and masks', value: 0.06 });
   const shared = await deduplicate(doc, signal), unused = prune(doc);
   // Alpha masks are image streams too, but rewriting them as RGB images makes
@@ -468,7 +469,7 @@ async function pass(bytes, settings, progress, signal) {
   const out = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 40 });
   check(signal);
   const verify = await PDFDocument.load(out, { updateMetadata: false });
-  if (verify.getPageCount() !== sizes.length || verify.getPages().some((p,i) => JSON.stringify([p.getMediaBox(),p.getCropBox(),p.getRotation().angle]) !== sizes[i])) throw new Error('PDF page validation failed. Original retained.');
+  if (verify.getPageCount() !== sizes.length || verify.getPages().some((p,i) => pageGeometry(p) !== sizes[i])) throw new Error('PDF page validation failed. Original retained.');
   return { bytes: out, pages: sizes.length, optimized, skipped, streams, duplicates, removed, settings };
 }
 export async function compressPdf(bytes, options = {}, progress = () => {}, signal) {
@@ -492,36 +493,123 @@ export async function compressPdf(bytes, options = {}, progress = () => {}, sign
   progress({ phase: 'Ready to download', value: 1 });
   return { ...best, originalBytes: bytes.length, outputBytes: best.bytes.length, savedPercent: Math.max(0, 100 * (1 - best.bytes.length / bytes.length)), targetMet: !target || best.bytes.length <= target };
 }
+const BATCH_BYTES = 128 * 1024 * 1024;
+const OUTPUT_BYTES = 256 * 1024 * 1024;
+const SAVE_OPTIONS = { useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 40 };
+const OUTPUT_LIMIT = 'The compressed PDF is still too large to finish locally. Try Smallest or export fewer frames.';
+function pageGeometry(page) {
+  const box = page.getMediaBox(), crop = page.getCropBox(), unit = num(page.node,'UserUnit',1), rotation = page.getRotation().angle;
+  if (![box.x,box.y,box.width,box.height,crop.x,crop.y,crop.width,crop.height,unit,rotation].every(Number.isFinite) || box.width<=0 || box.height<=0 || crop.width<=0 || crop.height<=0 || unit<=0) throw new Error('A frame export has invalid page dimensions.');
+  return JSON.stringify([box,crop,unit,rotation]);
+}
+async function appendPages(out, bytes, singlePage, signal) {
+  const doc = await loadPdf(bytes); check(signal);
+  if (singlePage && doc.getPageCount() !== 1) throw new Error('A frame export must contain exactly one page.');
+  const geometry = doc.getPages().map(pageGeometry);
+  const pages = await out.copyPages(doc, doc.getPageIndices()); check(signal);
+  for (const page of pages) out.addPage(page);
+  return geometry;
+}
 export async function mergeFrames(parts, progress = () => {}, signal) {
   if (!parts.length || parts.length > LIMITS.pages) throw new Error('Choose 1–300 frames.');
+  const out = await PDFDocument.create();
   let total = 0;
-  for (const part of parts) {
+  for (const [i, part] of parts.entries()) {
+    check(signal);
     if (!(part instanceof Uint8Array)) throw new Error('Invalid frame export.');
     total += part.length;
-    if (total > LIMITS.bytes) throw new Error('Frame exports exceed the 200 MiB local processing limit. Export fewer frames.');
+    if (total > LIMITS.bytes) throw new PdfLimitError('This PDF batch exceeds the local processing limit.');
+    progress({ phase: `Combining page ${i + 1} of ${parts.length}`, value: 0.01 });
+    await appendPages(out,part,true,signal);
+    if (out.context.enumerateIndirectObjects().length > LIMITS.objects) throw new PdfLimitError('This PDF batch has too many objects for local processing.');
+    await tick();
   }
-  const out = await PDFDocument.create();
-  for (let i = 0; i < parts.length; i++) {
-    check(signal); progress({ phase: `Combining page ${i + 1} of ${parts.length}`, value: 0.01 });
-    const doc = await loadPdf(parts[i]); check(signal);
-    if (doc.getPageCount() !== 1) throw new Error('A frame export must contain exactly one page.');
-    const source = doc.getPage(0), box = source.getMediaBox(), crop = source.getCropBox(), unit = num(source.node,'UserUnit',1);
-    if (![box.x,box.y,box.width,box.height,crop.x,crop.y,crop.width,crop.height,unit,source.getRotation().angle].every(Number.isFinite) || box.width<=0 || box.height<=0 || crop.width<=0 || crop.height<=0 || unit<=0) throw new Error('A frame export has invalid page dimensions.');
-    const [page] = await out.copyPages(doc,[0]); check(signal);
-    // Copy the complete native page, including its boxes, rotation and links.
-    // Compression later shares duplicate fonts, images and masks across pages.
-    out.addPage(page); await tick();
+  out.setProducer('Compress PDF'); check(signal);
+  const bytes = await out.save(SAVE_OPTIONS); check(signal);
+  return bytes;
+}
+
+// Receive native frames in order. Keep at most one raw batch plus the incoming
+// frame, and only keep compressed batches after processing them. Small jobs
+// still share resources and measure image placements across the whole document.
+export function createFrameExport(count, options = {}, progress = () => {}, signal) {
+  if (!Number.isInteger(count) || count < 1 || count > LIMITS.pages) throw new Error('Choose 1–300 frames.');
+  let received = 0, nativeBytes = 0, rawBytes = 0, packedBytes = 0, processed = 0;
+  let raw = [], finished = false;
+  const batches = [];
+  async function pack(parts) {
+    const start = processed;
+    const report = p => {
+      if (p.value >= 1) return;
+      const value = (0.3 * received + 0.6 * (start + parts.length * p.value)) / count;
+      progress({ ...p, phase: `Pages ${start+1}–${start+parts.length}: ${p.phase}`, value });
+    };
+    let result;
+    try {
+      const bytes = parts.length === 1 ? parts[0] : await mergeFrames(parts,report,signal);
+      result = await compressPdf(bytes,options,report,signal);
+    } catch (error) {
+      if (!(error instanceof PdfLimitError) || parts.length === 1) throw error;
+      const mid = Math.ceil(parts.length / 2);
+      await pack(parts.slice(0,mid)); await pack(parts.slice(mid));
+      return;
+    }
+    if (result.pages !== parts.length) throw new Error('PDF page validation failed. Export again.');
+    packedBytes += result.outputBytes;
+    if (packedBytes > OUTPUT_BYTES) throw new Error(OUTPUT_LIMIT);
+    batches.push(result); processed += result.pages;
   }
-  out.setProducer('Compress PDF');
-  check(signal);
-  const bytes = await out.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 40 });
-  check(signal); return bytes;
+  async function flush() {
+    if (!raw.length) return;
+    const parts = raw; raw = []; rawBytes = 0;
+    await pack(parts);
+  }
+  return {
+    async add(bytes) {
+      check(signal);
+      if (finished || received >= count || !(bytes instanceof Uint8Array) || !bytes.length) throw new Error('Unexpected frame page. Export again.');
+      if (bytes.length > LIMITS.bytes) throw new PdfLimitError('A single native PDF exceeds the 200 MiB processing limit.');
+      if (raw.length && rawBytes + bytes.length > BATCH_BYTES) await flush();
+      check(signal);
+      raw.push(bytes); rawBytes += bytes.length; nativeBytes += bytes.length; received++;
+    },
+    async finish() {
+      check(signal);
+      if (finished || received !== count) throw new Error('A frame page is missing. Export again.');
+      finished = true; await flush();
+      if (batches.length === 1) {
+        progress({ phase: 'Ready to download', value: 1 });
+        return batches.pop();
+      }
+      const out = await PDFDocument.create(), geometry = [];
+      const stats = { optimized:0, skipped:0, streams:0, duplicates:0, removed:0 };
+      let settings;
+      for (let i = 0; i < batches.length; i++) {
+        check(signal);
+        const batch = batches[i]; batches[i] = null;
+        progress({ phase: `Joining compressed pages (${geometry.length} of ${count})`, value: 0.9 + 0.05 * geometry.length/count });
+        geometry.push(...await appendPages(out,batch.bytes,false,signal));
+        for (const key of Object.keys(stats)) stats[key] += batch[key];
+        settings ||= batch.settings;
+        if (out.context.enumerateIndirectObjects().length > LIMITS.objects) {
+          stats.duplicates += await deduplicate(out,signal); stats.removed += prune(out);
+          if (out.context.enumerateIndirectObjects().length > LIMITS.objects) throw new Error(OUTPUT_LIMIT);
+        }
+      }
+      progress({ phase: 'Writing one PDF', value: 0.96 });
+      stats.duplicates += await deduplicate(out,signal); stats.removed += prune(out);
+      out.setProducer('Compress PDF'); check(signal);
+      const bytes = await out.save(SAVE_OPTIONS); check(signal);
+      if (bytes.length > OUTPUT_BYTES) throw new Error(OUTPUT_LIMIT);
+      const verify = await PDFDocument.load(bytes,{updateMetadata:false,throwOnInvalidObject:true}); check(signal);
+      if (verify.getPageCount() !== count || verify.getPages().some((page,i) => pageGeometry(page) !== geometry[i])) throw new Error('PDF page validation failed. Export again.');
+      progress({ phase: 'Ready to download', value: 1 });
+      return { ...stats, bytes, pages:count, settings, originalBytes:nativeBytes, outputBytes:bytes.length, originalRetained:false, savedPercent:Math.max(0,100*(1-bytes.length/nativeBytes)), targetMet:!options.targetMB||bytes.length<=options.targetMB*1_000_000 };
+    },
+  };
 }
 export async function compressFrames(parts, options = {}, progress = () => {}, signal) {
-  if (!parts.length || parts.length > LIMITS.pages) throw new Error('Choose 1–300 frames.');
-  check(signal);
-  const bytes = parts.length === 1 ? parts[0] : await mergeFrames(parts,progress,signal);
-  const result = await compressPdf(bytes,options,progress,signal);
-  if (result.pages !== parts.length) throw new Error('PDF page validation failed. Export again.');
-  return result;
+  const job = createFrameExport(parts.length,options,progress,signal);
+  for (const bytes of parts) await job.add(bytes);
+  return job.finish();
 }

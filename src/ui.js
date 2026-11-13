@@ -1,15 +1,15 @@
-import { compressFrames, PRESETS, LIMITS } from './engine.js';
+import { createFrameExport, PRESETS, LIMITS } from './engine.js';
 const $ = id => document.getElementById(id);
 const post = msg => parent.postMessage({ pluginMessage: msg }, '*');
 const size = n => n < 1_000_000 ? `${(n/1000).toFixed(0)} KB` : `${(n/1_000_000).toFixed(n >= 10_000_000 ? 1 : 2)} MB`;
-let frames = [], output = null, busy = false, job = 0, parts = [], receivedBytes = 0, worker = null, sequence = 0, abort = null, workerUnavailable = false, exportFrames = [];
-let settingsTouched = false;
+let frames = [], output = null, busy = false, job = 0, received = 0, receiving = false, worker = null, sequence = 0, abort = null, workerUnavailable = false, exportFrames = [];
+let settingsTouched = false, localExport = null;
 const pending = new Map();
 function stopWorker(error = new Error('Cancelled')) {
   const previous = worker; worker = null;
   if (previous) { previous.onmessage = null; previous.onerror = null; previous.terminate(); }
   for (const p of pending.values()) p.reject(error);
-  pending.clear(); abort?.abort();
+  pending.clear(); abort?.abort(); abort = null; localExport = null;
 }
 function getWorker() {
   if (workerUnavailable) return null;
@@ -36,22 +36,45 @@ function getWorker() {
     return worker;
   } finally { URL.revokeObjectURL(url); }
 }
-async function call(action, data, progress, current) {
+async function call(action, data, current) {
   if (current !== job) throw new Error('Cancelled');
-  let w; try { w = getWorker(); } catch { /* Hosts that block blob workers can still process locally. */ }
+  let w;
+  if (!localExport) {
+    try { w = getWorker(); }
+    catch { workerUnavailable = true; /* Some hosts block blob workers. */ }
+  }
+  const progress = p => {
+    if (current !== job || !busy) return;
+    $('progress').value = Math.max($('progress').value,p.value);
+    status(`${p.phase}${p.attempts > 1 ? ` · pass ${p.attempt}` : ''}`);
+  };
   if (!w) {
-    const controller = new AbortController(); abort = controller;
-    try { return await compressFrames(data.parts, data.options, progress, controller.signal); }
-    finally { if (abort === controller) abort = null; }
+    if (action === 'start-export') {
+      abort = new AbortController();
+      localExport = createFrameExport(data.count,data.options,progress,abort.signal);
+      return;
+    }
+    if (!localExport) throw new Error('The local PDF worker stopped. Export again.');
+    if (action === 'add-frame') return localExport.add(data.bytes);
+    const currentExport = localExport;
+    try { return await currentExport.finish(); }
+    finally { if (localExport === currentExport) { localExport = null; abort = null; } }
   }
   try {
     return await new Promise((resolve, reject) => {
       const id = ++sequence; pending.set(id, { resolve, reject, progress });
-      try { w.postMessage({ id, action, ...data }); }
+      try { w.postMessage({ id, action, ...data }, data.bytes ? [data.bytes.buffer] : []); }
       catch (error) { pending.delete(id); reject(error); }
     });
+  } catch (e) {
+    if (e.message === 'WORKER_UNAVAILABLE' && action === 'start-export') return call(action,data,current);
+    throw e;
   }
-  catch (e) { if (e.message === 'WORKER_UNAVAILABLE') return call(action,data,progress,current); throw e; }
+}
+function failExport(error, current) {
+  if (current !== job || !busy) return;
+  busy = false; receiving = false;
+  post({type:'cancel', requestId:current}); stopWorker(); status(error.message,true); controls();
 }
 function status(text, error = false) { $('status').textContent = text; $('status').classList.toggle('error', error); }
 function controls() {
@@ -101,9 +124,7 @@ function options() {
   if (p !== 'lossless' && (!Number.isFinite(Number($('quality').value)) || Number($('quality').value) < 40 || Number($('quality').value) > 100)) throw new Error('Image quality must be 40–100%.');
   return { preset: p, ...(p !== 'lossless' ? { dpi:Number($('dpi').value), quality:Number($('quality').value)/100 } : {}) };
 }
-async function compress(pages, current) {
-  const result = await call('compress-frames', { parts: pages, options: options() }, p => { if (current !== job) return; $('progress').value = p.value; status(`${p.phase}${p.attempts > 1 ? ` · pass ${p.attempt}` : ''}`); }, current);
-  if (current !== job) return;
+function showResult(result) {
   output = result;
   $('sizes').textContent = `${size(result.originalBytes)} → ${size(result.outputBytes)}`;
   $('savings').textContent = result.originalRetained ? 'Already optimized · native export retained' : `${result.savedPercent.toFixed(1)}% smaller`;
@@ -113,16 +134,21 @@ async function compress(pages, current) {
   notes.push('Frame text remains sharp vector artwork. Searchability depends on Figma’s export.');
   $('result-note').textContent = notes.join(' '); $('result-section').hidden = false;
   status('Ready to download your PDF.');
-  busy = false; parts = []; controls();
+  busy = false; controls();
   post({ type: 'preferences', preferences: { preset: $('preset').value, filename: $('filename').value } });
 }
 async function run() {
   if (busy || !frames.length || frames.length > LIMITS.pages) return;
-  try { options(); } catch (e) { status(e.message, true); return; }
+  let settings;
+  try { settings = options(); } catch (e) { status(e.message, true); return; }
   settingsTouched = true; clearResult(); busy = true; const current = ++job; $('progress').value = 0; controls();
+  received = 0; receiving = false; exportFrames = frames.slice();
   try {
-    parts = []; receivedBytes = 0; exportFrames = frames.slice(); post({ type:'export', ids:exportFrames.map(f=>f.id), requestId:current }); status('Exporting frames…');
-  } catch (e) { if (current !== job) return; busy = false; status(e.message, true); controls(); }
+    status('Preparing export…');
+    await call('start-export',{count:exportFrames.length,options:settings},current);
+    if (current !== job) return;
+    post({type:'export',ids:exportFrames.map(f=>f.id),requestId:current}); status('Exporting frames…');
+  } catch (error) { failExport(error,current); }
 }
 function filename() { let n = $('filename').value.trim().replace(/[\\/:*?"<>|\u0000-\u001f]/g,'-') || 'compressed.pdf'; if (!/\.pdf$/i.test(n)) n += '.pdf'; return n; }
 function download() {
@@ -146,28 +172,38 @@ window.addEventListener('message', async e => {
     const p = msg.preferences; if (Object.hasOwn(PRESETS, p.preset)) { $('preset').value = p.preset; preset(); } if (typeof p.filename === 'string') $('filename').value = p.filename;
   } else if (msg.requestId === job && busy) {
     if (msg.type === 'export-waiting') status('Finishing the cancelled export…');
-    if (msg.type === 'export-progress') { status(`Exporting ${msg.index+1} / ${msg.count}: ${msg.name}`); $('progress').value = .3 * msg.index/msg.count; }
+    if (msg.type === 'export-progress') { status(`Exporting ${msg.index+1} / ${msg.count}: ${msg.name}`); $('progress').value = Math.max($('progress').value,.3 * msg.index/msg.count); }
     if (msg.type === 'frame-pdf') {
+      const current = job;
+      let heartbeat;
       try {
-        if (msg.index !== parts.length || msg.count !== exportFrames.length) throw new Error('Frame pages arrived out of order. Export again.');
-        const bytes = new Uint8Array(msg.bytes); receivedBytes += bytes.length;
-        if (receivedBytes > LIMITS.bytes) throw new Error('Frame exports exceed 200 MiB. Export fewer frames.');
-        parts.push(bytes); post({type:'ack', requestId:job, index:msg.index});
-      } catch (e) { post({type:'cancel', requestId:job}); busy=false; parts=[]; status(e.message,true); controls(); }
+        if (receiving || msg.index !== received || msg.count !== exportFrames.length || received >= exportFrames.length) throw new Error('Frame pages arrived out of order. Export again.');
+        const bytes = msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes);
+        receiving = true;
+        heartbeat = setInterval(() => { if (current === job && busy) post({type:'frame-processing',requestId:current,index:msg.index}); },5000);
+        await call('add-frame',{bytes},current);
+        if (current !== job || !busy) return;
+        receiving = false; received++;
+        post({type:'ack',requestId:current,index:msg.index});
+      } catch (error) { failExport(error,current); }
+      finally { clearInterval(heartbeat); }
     }
     if (msg.type === 'export-complete') {
       const current = job;
-      try { if (parts.length !== exportFrames.length) throw new Error('A frame page is missing. Export again.'); const pages = parts; parts=[]; await compress(pages,current); }
-      catch (e) { if (current !== job) return; post({type:'cancel',requestId:current}); busy=false; parts=[]; status(e.message,true); controls(); }
+      try {
+        if (receiving || received !== exportFrames.length) throw new Error('A frame page is missing. Export again.');
+        const result = await call('finish-export',{},current);
+        if (current === job && busy) showResult(result);
+      } catch (error) { failExport(error,current); }
     }
-    if (msg.type === 'export-error') { busy=false; parts=[]; status(msg.message,true); controls(); }
+    if (msg.type === 'export-error') failExport(new Error(msg.message),job);
   }
 });
 $('preset').onchange = () => { settingsTouched = true; preset(); };
 $('filename').oninput = () => { settingsTouched = true; };
 for (const id of ['dpi','quality']) $(id).onchange = () => { settingsTouched = true; clearResult(); $('preset-help').textContent = `Custom image settings · ${$('dpi').value} DPI · ${$('quality').value}% quality.`; };
 $('run').onclick = run;
-$('cancel').onclick = () => { const requestId = job++; post({type:'cancel',requestId}); stopWorker(); parts=[]; busy=false; status('Cancelled. Your source is unchanged.'); controls(); };
+$('cancel').onclick = () => { const requestId = job++; post({type:'cancel',requestId}); stopWorker(); receiving=false; busy=false; status('Cancelled. Your source is unchanged.'); controls(); };
 $('download').onclick = download;
 const resizeHandle = $('resize-handle');
 let resizeDrag = null, resizeFrame = 0, resizeSize = null;

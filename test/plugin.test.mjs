@@ -17,9 +17,11 @@ before(async()=>{
   files.set('/ui.html',await readFile('dist/ui.html'));
   files.set('/host.html',Buffer.from(`<!doctype html><style>body{margin:0}iframe{width:100vw;height:100vh;border:0}</style><iframe name="plugin" id="plugin" src="/ui.html"></iframe><script>
   const send=m=>document.getElementById('plugin').contentWindow.postMessage({pluginMessage:m},'*');
+  const transfers=new Map();
   window.addEventListener('message',async e=>{const m=e.data.pluginMessage;if(!m)return;
   if(m.type==='ready')send({type:'selection',frames:[{id:'1:1',name:'Frame A',width:900,height:700,x:0,y:0},{id:'1:2',name:'Frame B',width:900,height:700,x:950,y:0}],ignored:0});
-  if(m.type==='export'){for(const [index,id] of m.ids.entries()){const bytes=new Uint8Array(await(await fetch(id==='1:2'?'/frame-b.pdf':'/frame-a.pdf')).arrayBuffer());send({type:'frame-pdf',requestId:m.requestId,index,count:m.ids.length,bytes});}send({type:'export-complete',requestId:m.requestId});}}
+  if(m.type==='ack'||m.type==='cancel'){const pending=transfers.get(m.requestId);if(pending&&(m.type==='cancel'||m.index===pending.index)){transfers.delete(m.requestId);pending.resolve(m.type==='ack');}}
+  if(m.type==='export'){for(const [index,id] of m.ids.entries()){const bytes=new Uint8Array(await(await fetch(id==='1:2'?'/frame-b.pdf':'/frame-a.pdf')).arrayBuffer());const ack=new Promise(resolve=>transfers.set(m.requestId,{index,resolve}));send({type:'frame-pdf',requestId:m.requestId,index,count:m.ids.length,bytes});if(!await ack)return;}send({type:'export-complete',requestId:m.requestId});}}
 
   );</script>`));
   files.set('/blocked-host.html',Buffer.from(files.get('/host.html').toString().replace('src="/ui.html"','src="/blocked-ui.html"')));
@@ -282,7 +284,12 @@ test('an error queued by a cancelled worker cannot terminate the next compressio
       constructor(){window.testWorkers.push(this);}
       set onerror(fn){this.errorHandler=fn;if(fn)this.savedError=fn;}
       get onerror(){return this.errorHandler;}
-      postMessage(request){this.request=request;}
+      postMessage(request){
+        if(request.action==='start-export')this.count=request.count;
+        if(request.action==='add-frame')this.bytes=request.bytes;
+        if(request.action==='finish-export')this.request=request;
+        else queueMicrotask(()=>this.onmessage?.({data:{id:request.id,result:null}}));
+      }
       terminate(){this.terminated=true;}
     };
   });
@@ -290,7 +297,7 @@ test('an error queued by a cancelled worker cannot terminate the next compressio
   await panel.locator('#cancel').click();await panel.locator('#run').click();await panel.waitForFunction(()=>window.testWorkers[1]?.request);
   await panel.evaluate(()=>window.testWorkers[0].savedError());
   assert.equal(await panel.evaluate(()=>!!window.testWorkers[1].terminated),false,'A stale callback must not stop the new worker');
-  await panel.evaluate(()=>{const w=window.testWorkers[1],r=w.request;w.onmessage({data:{id:r.id,result:{bytes:r.parts[0],pages:r.parts.length,originalBytes:r.parts[0].length,outputBytes:r.parts[0].length,savedPercent:0,originalRetained:true,optimized:0,duplicates:0,skipped:0}}});});
+  await panel.evaluate(()=>{const w=window.testWorkers[1],r=w.request;w.onmessage({data:{id:r.id,result:{bytes:w.bytes,pages:w.count,originalBytes:w.bytes.length,outputBytes:w.bytes.length,savedPercent:0,originalRetained:true,optimized:0,duplicates:0,skipped:0}}});});
   await panel.locator('#result-section').waitFor({state:'visible'});await ui.close();
 });
 
@@ -518,4 +525,72 @@ test('compression shares photos across standalone pages and respects their large
   await page.evaluate(async()=>{const parts=await Promise.all(['/small-placement.pdf','/large-placement.pdf'].map(async path=>new Uint8Array(await(await fetch(path)).arrayBuffer())));const r=await Crisp.compressFrames(parts,{preset:'balanced'});await fetch('/save/shared-pages.pdf',{method:'POST',body:r.bytes});});
   const out=await PDFDocument.load(await readFile('work/qa/shared-pages.pdf'));assert.equal(out.getPageCount(),2);
   const images=out.context.enumerateIndirectObjects().map(([,o])=>o).filter(o=>o instanceof PDFRawStream&&o.dict.get(n('Subtype'))?.toString()==='/Image');assert.equal(images.length,1);assert.equal(images[0].dict.lookup(n('Width')).asNumber(),600);
+});
+
+
+test('native export accepts a selection above 200 MiB and identifies an oversized individual frame',async()=>{
+  const mock=nativeExportMock();
+  mock.a.exportAsync=mock.b.exportAsync=async()=>({length:110*1024*1024});
+  vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',setTimeout,clearTimeout,console});
+  await mock.message({type:'export',ids:['b','a'],requestId:70});
+  assert.deepEqual(mock.posted.filter(m=>m.type==='frame-pdf').map(m=>m.index),[0,1]);assert.equal(mock.posted.at(-1).type,'export-complete');
+  mock.b.exportAsync=async()=>({length:201*1024*1024});
+  await mock.message({type:'export',ids:['b'],requestId:71});
+  assert.equal(mock.posted.at(-1).type,'export-error');assert.match(mock.posted.at(-1).message,/“b” alone exceeds 200 MiB/);
+});
+
+test('a real export over 200 MiB streams through the bundled worker into one ordered PDF',async()=>{
+  const inputs=[],count=6;
+  const native=await fixture({pages:1,dimension:3500,name:'Large frame'});
+  const source=await PDFDocument.load(native),p=source.getPage(0);
+  const n=PDFName.of;
+  for(let i=0;i<count;i++){
+    p.setSize(900+i,700+i);
+    const bytes=await source.save({useObjectStreams:false});
+    inputs.push(bytes.length); files.set(`/large-frame-${i}.pdf`,bytes);
+  }
+  const total=inputs.reduce((sum,bytes)=>sum+bytes,0);
+  assert.ok(total>200*1024*1024);
+  const largeHost=files.get('/host.html').toString().replace("[{id:'1:1',name:'Frame A',width:900,height:700,x:0,y:0},{id:'1:2',name:'Frame B',width:900,height:700,x:950,y:0}]",JSON.stringify(Array.from({length:count},(_,i)=>({id:String(i),name:`Large frame ${i+1}`})))).replace("id==='1:2'?'/frame-b.pdf':'/frame-a.pdf'",'`/large-frame-${id}.pdf`');
+  files.set('/large-host.html',Buffer.from(largeHost));
+  const ui=await browser.newPage({acceptDownloads:true});
+  try {
+    await ui.goto(url+'/large-host.html'); const panel=ui.frame({name:'plugin'});
+    await panel.locator('.frame').first().waitFor(); await panel.locator('#preset').selectOption('smallest');
+    await panel.getByText('Image settings',{exact:true}).click();
+    await panel.locator('#dpi').fill('72'); await panel.locator('#quality').fill('40');
+    await panel.locator('#run').click();
+    await panel.locator('#result-section').waitFor({state:'visible',timeout:90000});
+    assert.match(await panel.locator('#details').textContent(),/6 frames exported · 6 pages/);
+    const download=ui.waitForEvent('download');await panel.locator('#download').click();await(await download).saveAs('work/qa/large-batched.pdf');
+    const bytes=await readFile('work/qa/large-batched.pdf'),out=await PDFDocument.load(bytes);
+    assert.ok(bytes.length<total*0.1);assert.deepEqual(out.getPages().map(p=>p.getSize()),Array.from({length:count},(_,i)=>({width:900+i,height:700+i})));
+    for(const p of out.getPages()){
+      const link=out.context.lookup(p.node.Annots().get(0));
+      assert.equal(link.lookup(n('A')).lookup(n('URI')).decodeText(),'https://example.com');
+      const photo=p.node.Resources().lookup(n('XObject')).lookup(n('Photo'));
+      assert.equal(photo.dict.lookup(n('Subtype')).toString(),'/Image');
+      assert.equal(photo.dict.lookup(n('Width')).asNumber(),480);assert.ok(photo.getContentsSize()>0);
+      const content=p.node.Contents().asArray().map(ref=>Buffer.from(decodePDFRawStream(out.context.lookup(ref)).decode()).toString('latin1')).join('\n');
+      assert.ok(content.includes(Buffer.from('Large frame / page 1').toString('hex').toUpperCase()));
+    }
+    console.log(`Batched export: ${(total/1024/1024).toFixed(1)} MiB native → ${(bytes.length/1024/1024).toFixed(2)} MiB, ${out.getPageCount()} pages`);
+  } finally {
+    await ui.close();files.delete('/large-host.html');for(let i=0;i<count;i++)files.delete(`/large-frame-${i}.pdf`);
+  }
+});
+
+
+test('a slow batch keeps the native transfer alive while the panel is still processing',async()=>{
+  const mock=nativeExportMock(),timers=new Map();let now=0,sequence=0;
+  mock.figma.ui.postMessage=message=>mock.posted.push(message);
+  const advance=ms=>{now+=ms;for(const [id,timer] of timers)if(timer.at<=now){timers.delete(id);timer.fn();}};
+  vm.runInNewContext(await readFile('dist/code.js','utf8'),{figma:mock.figma,__html__:'',console,
+    setTimeout:(fn,delay)=>{const id=++sequence;timers.set(id,{fn,at:now+delay});return id;},clearTimeout:id=>timers.delete(id)});
+  const pending=mock.message({type:'export',ids:['a'],requestId:80});
+  while(!mock.posted.some(m=>m.type==='frame-pdf'))await new Promise(r=>setImmediate(r));
+  advance(25000);await mock.message({type:'frame-processing',requestId:80,index:0});advance(10000);
+  assert.ok(!mock.posted.some(m=>m.type==='export-error'));
+  await mock.message({type:'ack',requestId:80,index:0});await pending;
+  assert.equal(mock.posted.at(-1).type,'export-complete');assert.equal(timers.size,0);
 });

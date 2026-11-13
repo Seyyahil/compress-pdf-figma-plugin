@@ -23,7 +23,7 @@ Run **Compress PDF**, select frames, components, or component instances, set the
 - **Local processing:** original frames stay unchanged. If compression does not reduce size, the native export is returned.
 - **Vector compression:** large drawing streams are processed in bounded chunks. Balanced, Smallest, and High quality compact path coordinates with maximum page-space errors of 0.01, 0.02, and 0.001 PDF points respectively; text strings, colors, and transforms stay intact. Lossless preserves decoded drawing bytes.
 - **Long pages:** each selected item uses native PDF export without an arbitrary pixel-height limit. Frames retain their original size, vector artwork, and listed order.
-- **Limits:** 300 frames and 200 MiB native PDF. Figma must be able to export the artwork; already optimized PDFs may shrink only slightly.
+- **Large selections:** the plugin compresses native exports in batches and joins them into one PDF. The combined native exports can exceed 200 MiB. The limits are 300 frames, 200 MiB for any individual native frame, and 256 MiB for the compressed output. Figma must be able to export each frame.
 
 ## Development
 

@@ -5,10 +5,11 @@
     return node.type === "FRAME" || node.type === "COMPONENT" || node.type === "INSTANCE";
   }
   var MAX_FRAMES = 300;
-  var MAX_BYTES = 200 * 1024 * 1024;
+  var MAX_FRAME_BYTES = 200 * 1024 * 1024;
   var exporting = false;
   var cancelled = false;
   var acknowledge = null;
+  var refreshTransferTimeout = null;
   var activeRequest;
   var pendingIndex = -1;
   var sessionPreferences;
@@ -71,6 +72,8 @@
       }
     } else if (msg.type === "ack" && msg.requestId === activeRequest && msg.index === pendingIndex) {
       acknowledge == null ? void 0 : acknowledge();
+    } else if (msg.type === "frame-processing" && msg.requestId === activeRequest && msg.index === pendingIndex) {
+      refreshTransferTimeout == null ? void 0 : refreshTransferTimeout();
     } else if (msg.type === "export") {
       if (exporting) {
         if (cancelled) {
@@ -99,31 +102,37 @@
           if (ancestor !== figma.currentPage) throw new Error("Export frames from the current page.");
           nodes.push(node);
         }
-        let totalBytes = 0;
         for (let i = 0; i < nodes.length; i++) {
           checkExport();
           const node = nodes[i];
           post({ type: "export-progress", requestId, index: i, count: nodes.length, name: node.name });
           const bytes = await node.exportAsync({ format: "PDF", contentsOnly: true, useAbsoluteBounds: true });
           checkExport();
-          totalBytes += bytes.length;
-          if (totalBytes > MAX_BYTES) throw new Error("The native exports exceed 200 MiB. Export fewer frames.");
+          if (bytes.length > MAX_FRAME_BYTES) throw new Error(`\u201C${node.name}\u201D alone exceeds 200 MiB in Figma\u2019s native PDF export. Reduce this frame\u2019s source images and try again.`);
           await new Promise((resolve, reject) => {
             pendingIndex = i;
-            const timeout = setTimeout(() => {
-              acknowledge = null;
-              reject(new Error("The PDF panel stopped responding. Reopen the plugin."));
-            }, 3e4);
-            acknowledge = () => {
+            let timeout;
+            const cleanup = () => {
               clearTimeout(timeout);
               acknowledge = null;
+              refreshTransferTimeout = null;
+            };
+            refreshTransferTimeout = () => {
+              clearTimeout(timeout);
+              timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error("The PDF panel stopped responding. Reopen the plugin."));
+              }, 3e4);
+            };
+            refreshTransferTimeout();
+            acknowledge = () => {
+              cleanup();
               resolve();
             };
             try {
               post({ type: "frame-pdf", requestId, index: i, count: nodes.length, bytes });
             } catch (error) {
-              clearTimeout(timeout);
-              acknowledge = null;
+              cleanup();
               reject(error);
             }
           });
