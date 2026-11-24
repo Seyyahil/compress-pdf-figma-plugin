@@ -1,5 +1,6 @@
 import { PDFDocument, PDFName, PDFNumber, PDFDict, PDFArray, PDFRef, PDFRawStream, decodePDFRawStream } from 'pdf-lib';
 import pako from 'pako';
+import { PATH_OPERANDS, PATH_PAINT, PATH_VALUES, addSegment, createPath, pathText, resourcesWithShapes, shapeNames, shapeStore } from './shapes.js';
 
 export const LIMITS = { bytes: 200 * 1024 * 1024, pages: 300, pixels: 40_000_000, objects: 200_000 };
 export const PRESETS = {
@@ -328,7 +329,57 @@ async function loadPdf(bytes) {
   if (hasSignature(doc)) throw new Error('Could not process a digitally signed frame export.');
   return doc;
 }
-async function compressedContent(stream, signal, gain, tolerance) {
+// Read a stream's drawing commands with each path held back until it is painted.
+async function readDrawing(stream, signal, gain, tolerance, { operator, path: painted }) {
+  const state = graphicsState(), operands = [], fills = []; let nesting = 0, path = null, broken = false;
+  // A pattern is positioned by the stream that paints it, so it cannot follow an
+  // outline into another stream. A stream may also inherit one when it starts.
+  let patterned = true;
+  const release = paint => { painted(path, paint, !patterned); path = null; };
+  const lexer = contentLexer(t => {
+    if (t === 'BI') throw new Error('Inline image content preserved');
+    if (t === '[' || t === '<<') nesting++;
+    if (t === ']' || t === '>>') nesting--;
+    if (nesting || numeric(t) || t[0] === '/' || t[0] === '(' || t[0] === '<' || t === ']' || t === '>>') {
+      operands.push(t);
+      if (operands.length > 4096) throw new Error('Drawing operand limit');
+      return;
+    }
+    const count = PATH_OPERANDS[t];
+    if (count !== undefined && operands.length === count && operands.every(numeric)) {
+      // Account for every use of a shared form and its current transform.
+      // Rectangles add a position and a width, hence a full decimal quantum
+      // (rather than half) bounds the error in PDF page points.
+      const scale = gain * norm(state.matrix), precision = Math.max(0, Math.ceil(Math.log10(scale / tolerance)));
+      const numbers = operands.map(Number);
+      if (Number.isFinite(precision) && precision <= 9 && numbers.every(v => Math.abs(v) < 1e15)) {
+        path ||= createPath(precision, scale, !broken);
+        addSegment(path, t, numbers); operands.length = 0;
+        if (path.values.length > PATH_VALUES) { release(''); broken = true; }
+        return;
+      }
+    }
+    if (path) {
+      if (PATH_PAINT.has(t) && !operands.length) { release(t); broken = false; return; }
+      release(''); broken = true;
+    }
+    if (PATH_PAINT.has(t)) broken = false;
+    else if (count !== undefined) broken = true;
+    state.operator(t, operands);
+    if (t === 'q') fills.push(patterned);
+    else if (t === 'Q') patterned = fills.pop();
+    else if (t === 'cs') patterned = true;
+    else if (t === 'g' || t === 'rg' || t === 'k') patterned = false;
+    else if (t === 'sc' || t === 'scn') patterned = !operands.length || operands[operands.length - 1][0] === '/';
+    operator(operands, t); operands.length = 0;
+  });
+  await visitContent(stream, bytes => lexer.push(bytes), signal);
+  lexer.finish();
+  if (operands.length || nesting) throw new Error('Incomplete drawing commands');
+  if (path) release('');
+}
+const rewritesDrawing = (gain, tolerance) => gain > 0 && Number.isFinite(gain) && tolerance > 0;
+async function compressedContent(stream, signal, gain, tolerance, shapes, names) {
   const deflate = new pako.Deflate({ level: 9 }), chunks = []; let size = 0;
   deflate.onData = bytes => {
     size += bytes.length;
@@ -336,41 +387,21 @@ async function compressedContent(stream, signal, gain, tolerance) {
     chunks.push(bytes);
   };
   const write = bytes => { if (!deflate.push(bytes, false)) throw new Error('Content encoding failed'); };
-  let lexer;
-  if (gain > 0 && Number.isFinite(gain) && tolerance > 0) {
-    const state = graphicsState(), operands = []; let output = '', nesting = 0;
+  if (rewritesDrawing(gain, tolerance)) {
+    let output = '';
     const flush = () => {
       const bytes = new Uint8Array(output.length);
       for (let i = 0; i < output.length; i++) bytes[i] = output.charCodeAt(i);
       write(bytes); output = '';
     };
-    lexer = contentLexer(t => {
-      if (t === 'BI') throw new Error('Inline image content preserved');
-      if (t === '[' || t === '<<') nesting++;
-      if (t === ']' || t === '>>') nesting--;
-      if (nesting || numeric(t) || t[0] === '/' || t[0] === '(' || t[0] === '<' || t === ']' || t === '>>') {
-        operands.push(t);
-        if (operands.length > 4096) throw new Error('Drawing operand limit');
-        return;
-      }
-      const count = { m:2, l:2, c:6, v:4, y:4, re:4 }[t];
-      if (count && operands.length === count && operands.every(numeric)) {
-        // Account for every use of a shared form and its current transform.
-        // Rectangles add a position and a width, hence a full decimal quantum
-        // (rather than half) bounds the error in PDF page points.
-        const scale = gain * norm(state.matrix), precision = Math.max(0, Math.ceil(Math.log10(scale / tolerance)));
-        if (Number.isFinite(precision) && precision <= 9) for (let i = 0; i < operands.length; i++) {
-          const value = Number(operands[i]);
-          if (Number.isFinite(value) && Math.abs(value) < 1e15) operands[i] = value.toFixed(precision).replace(/(\.\d*?)0+$/,'$1').replace(/\.$/,'');
-        }
-      }
-      state.operator(t, operands);
-      output += (operands.length ? operands.join(' ') + ' ' : '') + t + '\n'; operands.length = 0;
-      if (output.length >= 65536) flush();
+    const add = text => { output += text; if (output.length >= 65536) flush(); };
+    await readDrawing(stream, signal, gain, tolerance, {
+      operator(operands, t) { add((operands.length ? operands.join(' ') + ' ' : '') + t + '\n'); },
+      path(path, paint, solid) {
+        if (names && solid && shapes.write(path, paint, add, names)) return;
+        add(pathText(path) + (paint ? paint + '\n' : ''));
+      },
     });
-    await visitContent(stream, bytes => lexer.push(bytes), signal);
-    lexer.finish();
-    if (operands.length || nesting) throw new Error('Incomplete drawing commands');
     if (output) flush();
   } else await visitContent(stream, write, signal);
   if (!deflate.push(new Uint8Array(), true) || deflate.err) throw new Error('Content encoding failed');
@@ -378,16 +409,48 @@ async function compressedContent(stream, signal, gain, tolerance) {
   for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
   return data;
 }
-async function reflate(doc, signal, gains, tolerance) {
+// Streams with their own resources, where a stored shape can be given a name.
+// A page stream shared by several pages would need one name in all of them.
+function shapeTargets(doc, gains) {
+  const targets = new Map(), shared = new Set();
+  const add = (stream, resources, page) => {
+    if (!(stream instanceof PDFRawStream) || !gains.has(stream) || !(resources instanceof PDFDict) || params(stream)) return;
+    const objects = resources.lookup(N('XObject'));
+    if (objects !== undefined && !(objects instanceof PDFDict)) return;
+    if (targets.has(stream)) shared.add(stream); else targets.set(stream, { resources, page });
+  };
+  for (const page of doc.getPages()) {
+    let contents = page.node.lookup(N('Contents'));
+    if (contents instanceof PDFArray && contents.size() === 1) contents = contents.lookup(0);
+    add(contents, page.node.Resources(), page.node);
+  }
+  for (const [,o] of doc.context.enumerateIndirectObjects()) if (o instanceof PDFRawStream && named(o.dict,'Subtype') === 'Form') add(o, o.dict.lookup(N('Resources')));
+  for (const stream of shared) targets.delete(stream);
+  return targets;
+}
+async function repeatedShapes(doc, signal, gains, tolerance) {
+  const shapes = shapeStore(doc.context), targets = new Map();
+  if (tolerance > 0) for (const [stream, target] of shapeTargets(doc, gains)) {
+    if (!rewritesDrawing(gains.get(stream), tolerance)) continue;
+    try {
+      await readDrawing(stream, signal, gains.get(stream), tolerance, { operator() {}, path(path, paint, solid) { if (solid) shapes.count(path, paint); } });
+      targets.set(stream, target);
+    } catch { check(signal); /* Unsupported streams keep their own outlines. */ }
+  }
+  return { shapes, targets };
+}
+async function reflate(doc, signal, gains, tolerance, { shapes, targets }) {
   let count = 0, i = 0;
   for (const [ref, o] of doc.context.enumerateIndirectObjects()) {
     check(signal);
     if (o instanceof PDFRawStream && !isImage(o) && !params(o) && ['', 'FlateDecode', 'LZWDecode', 'ASCII85Decode', 'ASCIIHexDecode'].includes(filterName(o))) {
       try {
-        const data = await compressedContent(o, signal, gains.get(o), tolerance);
+        const target = targets.get(o), names = target && shapeNames(target.resources);
+        const data = await compressedContent(o, signal, gains.get(o), tolerance, shapes, names);
         if (data.length < o.getContentsSize() - 32) {
           const d = cloneDict(o.dict);
           d.delete(N('DecodeParms')); d.delete(N('Length')); d.set(N('Filter'), N('FlateDecode'));
+          if (names?.used.size) (target.page || d).set(N('Resources'), resourcesWithShapes(doc.context, target.resources, names.used));
           doc.context.assign(ref, PDFRawStream.of(d, data)); count++;
         }
       } catch { check(signal); /* Unsupported or over-budget streams stay intact. */ }
@@ -463,14 +526,15 @@ async function pass(bytes, settings, progress, signal) {
     try { if (await optimizeImage(doc, ref, o, settings, use.get(ref.toString()))) optimized++; else skipped++; } catch { skipped++; }
     await tick();
   }
-  progress({ phase: 'Compressing PDF streams', value: 0.78 }); const streams = await reflate(doc, signal, gains, settings.vectorTolerance);
+  progress({ phase: 'Finding repeated shapes', value: 0.77 }); const repeated = await repeatedShapes(doc, signal, gains, settings.vectorTolerance);
+  progress({ phase: 'Compressing PDF streams', value: 0.78 }); const streams = await reflate(doc, signal, gains, settings.vectorTolerance, repeated);
   progress({ phase: 'Reusing identical resources', value: 0.85 }); const duplicates = shared + await deduplicate(doc, signal), removed = unused + prune(doc);
   check(signal); progress({ phase: 'Writing optimized PDF', value: 0.92 });
   const out = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false, objectsPerTick: 40 });
   check(signal);
   const verify = await PDFDocument.load(out, { updateMetadata: false });
   if (verify.getPageCount() !== sizes.length || verify.getPages().some((p,i) => pageGeometry(p) !== sizes[i])) throw new Error('PDF page validation failed. Original retained.');
-  return { bytes: out, pages: sizes.length, optimized, skipped, streams, duplicates, removed, settings };
+  return { bytes: out, pages: sizes.length, optimized, skipped, streams, shapes: repeated.shapes.placed, duplicates, removed, settings };
 }
 export async function compressPdf(bytes, options = {}, progress = () => {}, signal) {
   const preset = PRESETS[options.preset || 'balanced']; if (!preset) throw new Error('Unknown compression preset');
@@ -479,7 +543,7 @@ export async function compressPdf(bytes, options = {}, progress = () => {}, sign
   if (options.quality != null && settings.lossy) { if (!Number.isFinite(options.quality) || options.quality < 0.4 || options.quality > 1) throw new Error('Image quality must be 40–100%.'); settings.quality = options.quality; }
   if (options.targetMB != null && (!Number.isFinite(options.targetMB) || options.targetMB < 0 || options.targetMB > 200)) throw new Error('Target must be between 0 and 200 MB.');
   const target = (options.targetMB || 0) * 1_000_000;
-  let best = { bytes, pages: 0, originalRetained: true, optimized: 0, skipped: 0, streams: 0, duplicates: 0, removed: 0, settings };
+  let best = { bytes, pages: 0, originalRetained: true, optimized: 0, skipped: 0, streams: 0, shapes: 0, duplicates: 0, removed: 0, settings };
   const attempts = target && settings.lossy && options.preset !== 'print' ? 4 : 1;
   for (let i = 0; i < attempts; i++) {
     const setting = { ...settings, dpi: Math.max(72, Math.round(settings.dpi * Math.pow(0.8, i))), quality: Math.max(Math.min(0.5, settings.quality), settings.quality - i * 0.1) };
@@ -582,7 +646,7 @@ export function createFrameExport(count, options = {}, progress = () => {}, sign
         return batches.pop();
       }
       const out = await PDFDocument.create(), geometry = [];
-      const stats = { optimized:0, skipped:0, streams:0, duplicates:0, removed:0 };
+      const stats = { optimized:0, skipped:0, streams:0, shapes:0, duplicates:0, removed:0 };
       let settings;
       for (let i = 0; i < batches.length; i++) {
         check(signal);

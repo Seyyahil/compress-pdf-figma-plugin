@@ -7,7 +7,7 @@ import { chromium } from 'playwright';
 import { build } from 'esbuild';
 import { PDFDocument, PDFName, PDFNumber, PDFRawStream, decodePDFRawStream, StandardFonts, degrees, pushGraphicsState, popGraphicsState, concatTransformationMatrix, drawObject } from 'pdf-lib';
 import { mergeFrames } from '../src/engine.js';
-import { fixture, signedFixture, duplicateFixture } from './fixtures.mjs';
+import { fixture, signedFixture, duplicateFixture, outlinedText } from './fixtures.mjs';
 
 let browser, page, server, url; const files=new Map(); let externalRequests=[];
 before(async()=>{
@@ -593,4 +593,139 @@ test('a slow batch keeps the native transfer alive while the panel is still proc
   assert.ok(!mock.posted.some(m=>m.type==='export-error'));
   await mock.message({type:'ack',requestId:80,index:0});await pending;
   assert.equal(mock.posted.at(-1).type,'export-complete');assert.equal(timers.size,0);
+});
+
+// Follow every reference back to the outlines a viewer paints, in page points.
+function paintedOutlines(doc, stream, resources, matrix = [1,0,0,1,0,0], painted = [], depth = 0, color = 'inherited') {
+  const n = PDFName.of, mul = (a,b) => [a[0]*b[0]+a[2]*b[1],a[1]*b[0]+a[3]*b[1],a[0]*b[2]+a[2]*b[3],a[1]*b[2]+a[3]*b[3],a[0]*b[4]+a[2]*b[5]+a[4],a[1]*b[4]+a[3]*b[5]+a[5]];
+  const tokens = Buffer.from(decodePDFRawStream(stream).decode()).toString('latin1').match(/\/[^\s/[\]<>()]+|[^\s/[\]<>()]+/g) || [];
+  let args = [], path = [], clip = false; const stack = [];
+  for (const t of tokens) {
+    if (/^[-+.\d]/.test(t) || t[0] === '/') { args.push(t); continue; }
+    const v = args.map(Number);
+    if (t === 'q') stack.push([matrix,color]); else if (t === 'Q') [matrix,color] = stack.pop();
+    else if (t === 'cm') matrix = mul(matrix,v);
+    else if (['rg','scn','g'].includes(t)) color = args.join(' ');
+    else if (['m','l','c','h'].includes(t)) {
+      if (t === 'm') path.push([]);
+      const points = []; for (let i = 0; i < v.length; i += 2) points.push(matrix[0]*v[i]+matrix[2]*v[i+1]+matrix[4],matrix[1]*v[i]+matrix[3]*v[i+1]+matrix[5]);
+      path.at(-1).push([t,...points]);
+    } else if (t === 'W') clip = true;
+    else if (['f','f*','S','n'].includes(t)) { if (path.length) painted.push({ paint:t, clip, color, depth, outlines:path }); path = []; clip = false; }
+    else if (t === 'Do') {
+      const object = resources.lookup(n('XObject')).lookup(n(args[0].slice(1)));
+      assert.ok(object,`${args[0]} must resolve in its own resources`);
+      const box = object.dict.lookup(n('BBox')).asArray().map(x=>x.asNumber()), before = painted.length;
+      paintedOutlines(doc,object,object.dict.lookup(n('Resources'))||resources,matrix,painted,depth+1,color);
+      if (object.dict.has(n('Group')) === false && depth > 0) for (const fill of painted.slice(before)) for (const [,...p] of fill.outlines.flat()) for (let i = 0; i < p.length; i += 2) {
+        const x = (p[i]-matrix[4])/matrix[0], y = (p[i+1]-matrix[5])/matrix[3];
+        assert.ok([x-box[0],box[2]-x,y-box[1],box[3]-y].every(margin => margin*matrix[0] >= 255),'Bounds near an outline would soften it when zoomed out');
+      }
+    }
+    args = [];
+  }
+  return painted;
+}
+const visible = fills => fills.flatMap(fill => fill.outlines.filter(o => o.flatMap(([,...p])=>p).some((v,i,all)=>Math.abs(v-all[i%2])>1e-9)).map(outline => ({ ...fill, outline })));
+function assertSameOutlines(before, after, tolerance) {
+  const a = visible(before), b = visible(after), cells = new Map(), cell = v => Math.round(v/2);
+  assert.equal(b.length,a.length,'Every visible outline is painted exactly once');
+  for (const item of b) { const [,x,y] = item.outline[0], key = cell(x)+','+cell(y); if (!cells.has(key)) cells.set(key,[]); cells.get(key).push(item); }
+  for (const item of a) {
+    const [,x,y] = item.outline[0]; let match = null;
+    for (let i = -1; i <= 1 && !match; i++) for (let j = -1; j <= 1 && !match; j++) {
+      const list = cells.get((cell(x)+i)+','+(cell(y)+j)) || [];
+      const at = list.findIndex(o => o.paint === item.paint && o.clip === item.clip && o.color === item.color && o.outline.length === item.outline.length && o.outline.every((s,k) => s[0] === item.outline[k][0] && s.every((v,m) => m === 0 || Math.abs(v-item.outline[k][m]) <= tolerance)));
+      if (at >= 0) [match] = list.splice(at,1);
+    }
+    assert.ok(match,`An outline at ${x}, ${y} moved more than ${tolerance} points, or changed color or fill`);
+  }
+}
+async function shapeDocument(content, { scale = 1, extra = {}, placement = `q ${scale} 0 0 ${scale} 0 0 cm /Art Do Q` } = {}) {
+  const doc = await PDFDocument.create(), p = doc.addPage([700*scale,900*scale]), n = PDFName.of, zlib = await import('node:zlib');
+  const form = doc.context.register(PDFRawStream.of(doc.context.obj({Type:'XObject',Subtype:'Form',BBox:[0,0,700,900],Resources:extra,Filter:'FlateDecode'}),zlib.deflateSync(Buffer.from(content))));
+  p.node.setXObject(n('Art'),form); p.node.set(n('Contents'),doc.context.register(doc.context.flateStream(placement)));
+  return doc.save();
+}
+async function runShapes(name, bytes, options) {
+  files.set(`/${name}.pdf`,bytes);
+  const result = await page.evaluate(async ([name,options]) => { const r = await Crisp.compressPdf(new Uint8Array(await(await fetch(`/${name}.pdf`)).arrayBuffer()),options); await fetch(`/save/${name}.pdf`,{method:'POST',body:r.bytes}); return {input:r.originalBytes,output:r.outputBytes,shapes:r.shapes,pages:r.pages}; },[name,options]);
+  return { ...result, before: await PDFDocument.load(bytes), after: await PDFDocument.load(await readFile(`work/qa/${name}.pdf`)) };
+}
+const pageFills = (doc, index = 0) => { const p = doc.getPage(index); return paintedOutlines(doc,p.node.Contents() instanceof PDFRawStream ? p.node.Contents() : doc.context.lookup(p.node.Contents().get(0)),p.node.Resources()); };
+const shapeForms = doc => doc.context.enumerateIndirectObjects().map(([,o])=>o).filter(o => o instanceof PDFRawStream && o.dict.lookup(PDFName.of('Subtype'))?.toString() === '/Form' && o.dict.lookup(PDFName.of('Resources'))?.entries().length === 0 && o.dict.lookup(PDFName.of('BBox')).lookup(2).asNumber() < 700);
+
+test('repeated outlined text is stored once and painted in the same place',async()=>{
+  const { commands, outlines } = outlinedText();
+  const { input, output, shapes, before, after } = await runShapes('shapes',await shapeDocument('0.1 0.2 0.3 scn\n'+commands+'f\nn\n'),{preset:'balanced'});
+  assert.ok(shapes > 1500,`Only ${shapes} outlines were placed by reference`);
+  assert.ok(output < input*.25,`Repeated text must shrink far below ${input} bytes, got ${output}`);
+  assert.equal(shapeForms(after).length,24);
+  assert.equal(visible(pageFills(before)).length,outlines);
+  assertSameOutlines(pageFills(before),pageFills(after),0.01);
+});
+
+test('shape reuse keeps its error bound where a form is enlarged',async()=>{
+  const { commands } = outlinedText({lines:30});
+  for (const [preset,tolerance] of [['balanced',.01],['smallest',.02],['print',.001]]) {
+    const { before, after } = await runShapes('shapes-scaled',await shapeDocument('0 g\n'+commands+'f\n',{scale:8}),{preset});
+    assertSameOutlines(pageFills(before),pageFills(after),tolerance+1e-9);
+  }
+});
+
+test('shape reuse never separates touching outlines, lone rectangles, patterns, clips or strokes',async()=>{
+  const { commands } = outlinedText({lines:20}), letters = outlinedText({lines:20,columns:30,x:400}).commands.split('h\n').filter(o=>o.includes(' c')).map(o=>o+'h\n').join('');
+  const stem = (x,y) => `${x} ${y} m\n${x+2.1234} ${y} l\n${x+2.1234} ${y+10.4567} l\n${x} ${y+10.4567} l\n${x} ${y} l\nh\n`;
+  const stems = Array.from({length:600},(_,i)=>stem(10+(i%60)*6,400+Math.floor(i/60)*14)).join('');
+  const pair = (x,y) => `${x} ${y} m\n${x+12} ${y} ${x+18} ${y+6} ${x+18} ${y+18} c\n${x+6} ${y+18} ${x} ${y+12} ${x} ${y} c\nh\n${x+6} ${y+6} m\n${x+24} ${y+6} ${x+30} ${y+12} ${x+30} ${y+27} c\n${x+12} ${y+27} ${x+6} ${y+18} ${x+6} ${y+6} c\nh\n`;
+  const pairs = Array.from({length:60},(_,i)=>pair(10+(i%12)*50.5,600+Math.floor(i/12)*40.25)).join('');
+  const content = `0.5 scn\n${commands}f\nn\n0.6 scn\n${stems}f\n0.65 scn\n${letters}${stem(650,860)}f\n0.7 scn\n${pairs}f\n0.5 scn\n${commands}f*\n/P1 scn\n${commands}f\n0.25 scn\n${commands}S\nq\n${commands}W\nn\nQ\nq\n${commands}W\nf\nQ\n0.8 scn\n${letters}1 w\n${pairs}f\n`;
+  const { before, after, shapes } = await runShapes('shapes-kept',await shapeDocument(content,{extra:{Pattern:{P1:{PatternType:2,Shading:{ShadingType:2,ColorSpace:'DeviceGray',Coords:[0,0,1,0],Function:{FunctionType:2,Domain:[0,1],C0:[0],C1:[1],N:1}}}}}}),{preset:'balanced'});
+  assert.ok(shapes > 0);
+  const result = pageFills(after);
+  assertSameOutlines(pageFills(before),result,0.01);
+  for (const fill of result) if (fill.color === '/P1' || fill.clip || fill.paint === 'S' || fill.color === '0.8') assert.equal(fill.depth,1,'Patterns, clips, strokes and interrupted paths stay in the stream that paints them');
+  for (const fill of result) assert.ok(fill.outlines.length > 1 || fill.outlines[0].some(([op])=>op === 'c'),'A rectangle that shared its fill must not be painted alone');
+  assert.ok(result.some(fill => fill.color === '0.65' && fill.depth > 1),'Letters beside a single rectangle are still reused');
+  const joined = result.filter(fill => fill.color === '0.7');
+  assert.ok(joined.some(fill => fill.depth > 1));
+  for (const fill of joined) assert.equal(fill.outlines.length%2,0,'Overlapping outlines are one fill');
+  assert.ok(result.some(fill => fill.paint === 'f*' && fill.depth > 1),'Even-odd fills are reused with their own rule');
+});
+
+test('page content reuses shapes without changing inherited, shared or existing resources',async()=>{
+  const { commands } = outlinedText({lines:25}), n = PDFName.of, doc = await PDFDocument.create(), zlib = await import('node:zlib');
+  const badge = doc.context.register(doc.context.flateStream('0 g 10 10 m 20 10 l 20 20 l h f',{Type:'XObject',Subtype:'Form',BBox:[0,0,30,30],Resources:{}}));
+  const draw = (extra = '') => doc.context.register(PDFRawStream.of(doc.context.obj({Filter:'FlateDecode'}),zlib.deflateSync(Buffer.from(`0.3 g\n${commands}f\n${extra}`))));
+  const own = draw('q /s1 Do Q\n'), shared = draw('q 1 0 0 1 5 5 cm /s1 Do Q\n');
+  for (let i = 0; i < 4; i++) { const p = doc.addPage([700,900]); p.node.delete(n('Resources')); p.node.set(n('Contents'),i < 2 ? (i ? draw('q 1 0 0 1 9 9 cm /s1 Do Q\n') : own) : shared); }
+  doc.catalog.Pages().set(n('Resources'),doc.context.obj({XObject:{s1:badge}}));
+  const { before, after, pages, shapes } = await runShapes('shapes-pages',await doc.save(),{preset:'balanced'});
+  assert.equal(pages,4);assert.ok(shapes > 0);
+  for (let i = 0; i < 4; i++) assertSameOutlines(pageFills(before,i),pageFills(after,i),0.01);
+  assert.ok(pageFills(after,0).some(fill => fill.depth === 1 && fill.color === '0.3'),'A page with its own drawing reuses shapes');
+  assert.equal(after.getPage(2).node.get(n('Contents')).toString(),after.getPage(3).node.get(n('Contents')).toString());
+  assert.ok(pageFills(after,2).every(fill => fill.depth === 0 || fill.color === '0'),'A drawing shared by pages stays as written');
+  assert.deepEqual(after.catalog.Pages().lookup(n('Resources')).lookup(n('XObject')).keys().map(k=>k.decodeText()),['s1']);
+});
+
+test('lossless export and artwork without repeats keep their own outlines',async()=>{
+  const { commands } = outlinedText({lines:20}), content = '0.1 g\n'+commands+'f\n';
+  const lossless = await runShapes('shapes-lossless',await shapeDocument(content),{preset:'lossless'});
+  assert.equal(lossless.shapes,0);
+  const art = lossless.after.getPage(0).node.Resources().lookup(PDFName.of('XObject')).lookup(PDFName.of('Art'));
+  assert.equal(Buffer.from(decodePDFRawStream(art).decode()).toString('latin1'),content);
+  const unique = await runShapes('shapes-unique',await shapeDocument('0.1 g\n'+outlinedText({unique:true}).commands+'f\n'),{preset:'balanced'});
+  assert.equal(unique.shapes,0);assert.equal(shapeForms(unique.after).length,0);
+  assertSameOutlines(pageFills(unique.before),pageFills(unique.after),0.01);
+});
+
+test('frames exported separately share one copy of each shape',async()=>{
+  const { commands } = outlinedText({lines:20}), other = outlinedText({lines:20,x:77.5,y:210.25}).commands;
+  files.set('/shape-frame-a.pdf',await shapeDocument('0 g\n'+commands+'f\n'));files.set('/shape-frame-b.pdf',await shapeDocument('0 g\n'+other+'f\n'));
+  const shapes = await page.evaluate(async()=>{const parts=await Promise.all(['/shape-frame-a.pdf','/shape-frame-b.pdf'].map(async path=>new Uint8Array(await(await fetch(path)).arrayBuffer())));const r=await Crisp.compressFrames(parts,{preset:'balanced'});await fetch('/save/shape-frames.pdf',{method:'POST',body:r.bytes});return r.shapes;});
+  assert.ok(shapes > 0);
+  const out = await PDFDocument.load(await readFile('work/qa/shape-frames.pdf'));
+  assert.equal(shapeForms(out).length,24);
+  for (const [index,name] of ['/shape-frame-a.pdf','/shape-frame-b.pdf'].entries()) assertSameOutlines(pageFills(await PDFDocument.load(files.get(name))),pageFills(out,index),0.01);
 });

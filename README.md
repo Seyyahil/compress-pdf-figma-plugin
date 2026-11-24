@@ -22,6 +22,7 @@ Run **Compress PDF**, select frames, components, or component instances, set the
 - **Presets:** Balanced, Smallest, High quality, or Lossless. Custom DPI and quality are available. Image resolution is measured at the largest use of each shared image.
 - **Local processing:** original frames stay unchanged. If compression does not reduce size, the native export is returned.
 - **Vector compression:** large drawing streams are processed in bounded chunks. Balanced, Smallest, and High quality compact path coordinates with maximum page-space errors of 0.01, 0.02, and 0.001 PDF points respectively; text strings, colors, and transforms stay intact. Lossless preserves decoded drawing bytes.
+- **Repeated shapes:** Figma writes text as outlines, so the same letter can repeat thousands of times. Balanced, Smallest, and High quality store each repeated filled outline once and place it by reference, within the same maximum errors. Text and artwork stay vector, and searchable text is unchanged.
 - **Long pages:** each selected item uses native PDF export without an arbitrary pixel-height limit. Frames retain their original size, vector artwork, and listed order.
 - **Large selections:** the plugin compresses native exports in batches and joins them into one PDF. The combined native exports can exceed 200 MiB. The limits are 300 frames, 200 MiB for any individual native frame, and 256 MiB for the compressed output. Figma must be able to export each frame.
 
@@ -37,6 +38,6 @@ npm run check:distribution
 
 Rebuild with `npm run build` after code changes and commit the updated `dist` files with the source. CI checks the code and tests, confirms the manifest's runtime files are tracked, and rejects bundles that differ from a fresh build.
 
-Tests cover components and instances, page order and dimensions, large vector streams, transform-aware coordinate precision, the Figma message flow, cancellation and retry, worker fallback, PDF drawing commands, transparency masks, image placement, and the output size guard.
+Tests cover components and instances, page order and dimensions, large vector streams, transform-aware coordinate precision, repeated shapes, the Figma message flow, cancellation and retry, worker fallback, PDF drawing commands, transparency masks, image placement, and the output size guard.
 
 [Third-party notices](THIRD_PARTY_NOTICES.md).

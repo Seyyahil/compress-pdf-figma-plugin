@@ -58,3 +58,25 @@ export async function duplicateFixture() {
   }
   return doc.save({useObjectStreams:false});
 }
+
+// Text the way Figma exports it: every letter is a closed outline at absolute
+// coordinates, spaces are single points, and one fill paints a whole block.
+export function outlinedText({ lines = 40, columns = 60, x = 20.123456, y = 30.654321, size = 9, unique = false } = {}) {
+  const f = v => v.toFixed(6); let random = 41, out = '', outlines = 0;
+  const next = () => (random = (Math.imul(random,1664525)+1013904223)>>>0) / 4294967296;
+  const glyphs = Array.from({length:24},()=>Array.from({length:12},()=>.12+next()*.3));
+  const ring = (cx,cy,r,w,reverse) => {
+    const p = Array.from({length:8},(_,i)=>{ const a = (reverse ? -1 : 1)*i*Math.PI/4; return [cx+Math.cos(a)*r*w[i%w.length]*size,cy+Math.sin(a)*r*w[(i+3)%w.length]*size]; });
+    outlines++;
+    return `${p[0].map(f).join(' ')} m\n`+[0,2,4,6].map(i=>`${[...p[i+1],...p[i+1],...p[(i+2)%8]].map(f).join(' ')} c\n`).join('')+'h\n';
+  };
+  for (let line = 0; line < lines; line++) for (let column = 0; column < columns; column++) {
+    const cx = x+(column+.5)*size, cy = y+(line+.5)*size*1.4, pick = Math.floor(next()*28);
+    if (pick >= 26) { out += `${f(cx)} ${f(cy)} m\nh\n`; continue; }
+    if (pick >= 24) { const w = size*.08, h = size*.4; outlines++; out += `${f(cx-w)} ${f(cy-h)} m\n${f(cx+w)} ${f(cy-h)} l\n${f(cx+w)} ${f(cy+h)} l\n${f(cx-w)} ${f(cy+h)} l\nh\n`; continue; }
+    const shape = unique ? Array.from({length:12},()=>.12+next()*.3) : glyphs[pick];
+    out += ring(cx,cy,1,shape,false);
+    if (pick%3 === 0) out += ring(cx,cy,.4,shape,true);
+  }
+  return { commands: out, outlines };
+}
